@@ -1,0 +1,59 @@
+name: Release CI
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to create after both native jobs pass
+        required: true
+        type: string
+        default: v0.01
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    uses: ./.github/workflows/native.yml
+    with:
+      package: true
+      release_tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+  draft:
+    name: Verify artifacts and create draft release
+    needs: native
+    if: github.repository == 'sh4869221b/zig-nico-list'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the exact tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download Linux package from this workflow run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-linux-x86_64
+          path: release-input/linux-x86_64
+          digest-mismatch: error
+      - name: Download Windows package from this workflow run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-windows-x86_64
+          path: release-input/windows-x86_64
+          digest-mismatch: error
+      - name: Verify checksums and create a draft for manual review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: python scripts/draft_release.py

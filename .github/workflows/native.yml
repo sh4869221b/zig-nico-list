@@ -1,0 +1,72 @@
+name: Native tests and repeat builds
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: Prepare release archives after all native checks pass
+        type: boolean
+        default: false
+      release_tag:
+        description: Explicit version tag for release packaging
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x86_64
+            binary: zig-out/bin/zig-nico-list
+          - runner: windows-2025
+            target: windows-x86_64
+            binary: zig-out/bin/zig-nico-list.exe
+    env:
+      PYTHONUTF8: '1'
+      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-test-global
+      ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-test-local
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test release helpers
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Install checksum-pinned Zig 0.17.0
+        run: python scripts/install_zig.py
+      - name: Check Zig formatting
+        run: zig fmt --check build.zig src
+      - name: Run native unit tests in ReleaseSafe
+        run: zig build test -Doptimize=safe
+      - name: Compare two native ReleaseFast baseline builds
+        run: python scripts/check_build.py
+      - name: Run native CLI integration tests
+        env:
+          TEST_BINARY: ${{ matrix.binary }}
+        shell: bash
+        run: python tests/integration.py "$TEST_BINARY"
+      - name: Create and compare normalized release archives
+        if: inputs.package
+        run: python scripts/package_release.py
+      - name: Upload verified release inputs
+        if: inputs.package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+          overwrite: true

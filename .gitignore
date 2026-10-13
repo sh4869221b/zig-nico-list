@@ -1,0 +1,8 @@
+.zig-cache/
+.zig-global-cache/
+zig-out*/
+.toolchains/
+dist/
+__pycache__/
+*.pyc
+WORKLOG.md
