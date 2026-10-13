@@ -169,7 +169,9 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
     if (cfg.logfile.len > 0) {
         logfile = Io.Dir.cwd().createFile(init.io, cfg.logfile, .{ .truncate = false }) catch |e| return fail(err, try std.fmt.allocPrint(a, "open {s}: {s}", .{ cfg.logfile, @errorName(e) }));
         file_writer = logfile.?.writer(init.io, &log_buffer);
-        try file_writer.seekTo((try logfile.?.stat(init.io)).size);
+        // Query only the length: full Windows file metadata requires access
+        // that a write-only logfile handle intentionally does not request.
+        try file_writer.seekTo(try logfile.?.length(init.io));
         log_writer = &file_writer.interface;
     }
     var control = domain.Control.init(init.io, cfg);

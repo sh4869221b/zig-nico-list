@@ -195,6 +195,11 @@ class CliIntegration(unittest.TestCase):
             self.check_ok(result, 'sm2\nsm10\n')
             self.assertIn('video list', path.read_text())
             self.assertNotIn('"level"', result.stdout)
+            first = path.read_bytes()
+            self.check_ok(command(server, '--logfile', str(path), USER), 'sm2\nsm10\n')
+            appended = path.read_bytes()
+            self.assertTrue(appended.startswith(first))
+            self.assertGreater(len(appended), len(first))
 
     def test_scheduler_terminal_and_deadline_regressions(self):
         for mode in ('earlier_empty', 'earlier_404', 'earlier_error', 'short_deadline',
