@@ -32,8 +32,8 @@ jobs:
             binary: zig-out/bin/zig-nico-list.exe
     env:
       PYTHONUTF8: '1'
-      ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-test-global
-      ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-test-local
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
       RELEASE_TAG: ${{ inputs.release_tag }}
       RELEASE_COMMIT: ${{ github.sha }}
     steps:
