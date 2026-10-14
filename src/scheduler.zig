@@ -71,6 +71,7 @@ pub const Scheduler = struct {
             var context = job.scheduler.ctx;
             context.result_allocator = job.arena.allocator();
             context.deadline = &job.deadline;
+            context.target_sequence = job.target.result.order;
             return domain.fetchPage(&context, job.target.result.target, job.number);
         }
         fn deinit(job: *Job, allocator: Allocator) void {

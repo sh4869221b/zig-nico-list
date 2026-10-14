@@ -78,6 +78,9 @@ pub const Snapshot = struct {
     healthy_windows: usize,
     decision_buffer: [decision_history]Decision = @splat(.{}),
     decision_count: usize,
+    initial_decision_buffer: [decision_history]Decision = @splat(.{}),
+    initial_decision_count: usize = 0,
+    decisions_total: u64 = 0,
 
     pub fn decisions(self: *const Snapshot) []const Decision {
         return self.decision_buffer[0..self.decision_count];
@@ -90,6 +93,8 @@ pub const Snapshot = struct {
         inline for (@typeInfo(JsonSnapshot).@"struct".field_names) |field_name| {
             if (comptime std.mem.eql(u8, field_name, "decisions")) {
                 result.decisions = self.decisions();
+            } else if (comptime std.mem.eql(u8, field_name, "initial_decisions")) {
+                result.initial_decisions = self.initial_decision_buffer[0..self.initial_decision_count];
             } else {
                 @field(result, field_name) = @field(self, field_name);
             }
@@ -126,6 +131,8 @@ pub const JsonSnapshot = struct {
     recovery_starts_remaining: isize,
     healthy_windows: usize,
     decisions: []const Decision,
+    initial_decisions: []const Decision,
+    decisions_total: u64,
 };
 
 const Window = struct {
@@ -220,6 +227,9 @@ pub const Controller = struct {
     decision_buffer: [decision_history]Decision = @splat(.{}),
     decision_next: usize = 0,
     decision_count: usize = 0,
+    initial_decision_buffer: [decision_history]Decision = @splat(.{}),
+    initial_decision_count: usize = 0,
+    decisions_total: u64 = 0,
 
     /// Zero means no configured ceiling, while admission always remains positive.
     pub fn init(maximum: isize, now_ns: i64) Controller {
@@ -452,8 +462,19 @@ pub const Controller = struct {
             .generation = self.generation,
             .reason = reason,
         };
+        if (self.initial_decision_count < decision_history) {
+            self.initial_decision_buffer[self.initial_decision_count] = self.decision_buffer[self.decision_next];
+            self.initial_decision_count += 1;
+        }
+        self.decisions_total +|= 1;
         self.decision_next = (self.decision_next + 1) % decision_history;
         self.decision_count = @min(self.decision_count + 1, decision_history);
+    }
+
+    /// Offset zero is newest; caller must hold the owning Control lock.
+    pub fn recentDecision(self: *const Controller, offset: usize) Decision {
+        std.debug.assert(offset < self.decision_count);
+        return self.decision_buffer[(self.decision_next + decision_history - 1 - offset) % decision_history];
     }
 
     pub fn snapshot(self: *const Controller, now_ns: i64) Snapshot {
@@ -484,6 +505,9 @@ pub const Controller = struct {
             .recovery_starts_remaining = self.recovery_starts,
             .healthy_windows = self.healthy_windows,
             .decision_count = self.decision_count,
+            .initial_decision_buffer = self.initial_decision_buffer,
+            .initial_decision_count = self.initial_decision_count,
+            .decisions_total = self.decisions_total,
         };
         const first = (self.decision_next + decision_history - self.decision_count) % decision_history;
         for (0..self.decision_count) |i| result.decision_buffer[i] = self.decision_buffer[(first + i) % decision_history];
@@ -1032,4 +1056,16 @@ test "JSON snapshot uses Go field names and bounded decisions without null quant
     try testing.expectEqual(@as(usize, 1), object.get("decisions").?.array.items.len);
     try testing.expect(object.get("window").?.object.get("success_p95_seconds") == null);
     try testing.expectEqual(@as(f64, 0.1), object.get("last_window").?.object.get("success_p95_seconds").?.float);
+}
+
+test "initial adaptive evidence survives recent decision ring wrap" {
+    var controller = Controller.init(0, 0);
+    for (0..decision_history * 3) |i| controller.record(@intCast(i + 1), controller.limit, "healthy");
+    const snapshot = controller.snapshot(1000);
+    try std.testing.expectEqual(@as(u64, decision_history * 3), snapshot.decisions_total);
+    try std.testing.expectEqual(decision_history, snapshot.initial_decision_count);
+    try std.testing.expectEqual(@as(f64, 1e-9), snapshot.initial_decision_buffer[0].elapsed_seconds);
+    try std.testing.expect(snapshot.decisions()[0].elapsed_seconds > snapshot.initial_decision_buffer[decision_history - 1].elapsed_seconds);
+    controller.initial_decision_buffer[0].reason = "mutated";
+    try std.testing.expectEqualStrings("healthy", snapshot.jsonView().initial_decisions[0].reason);
 }

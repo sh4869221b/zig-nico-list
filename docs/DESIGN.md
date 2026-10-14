@@ -68,7 +68,11 @@ the configured attempt/backoff budget. Caller cancellation stays neutral.
 A failed target retains its successfully committed page prefix, carries an
 error in JSON and diagnostics, and increments fetch_err. The default exit is
 nonzero; explicit --best-effort keeps its existing exit-code override. Error/404 response
-bodies are closed without a blocking drain, as in the first port.
+bodies are closed without a blocking drain; explicitly framed empty bodies can
+retain keep-alive. A successful body read must also complete HTTP framing before
+JSON parsing; premature framed EOF is a terminal TruncatedResponseBody failure.
+See [HTTP diagnostics](HTTP_DIAGNOSTICS.md) for attempt tracing and bounded
+initial/recent adaptive history.
 
 ## Memory ownership
 

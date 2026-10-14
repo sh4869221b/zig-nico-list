@@ -80,6 +80,15 @@ const Runner = struct {
         defer self.mutex.unlock(self.init.io);
         self.logLocked(level, message, detail) catch {};
     }
+    fn trace(context: ?*anyopaque, value: domain.AttemptTrace) void {
+        const self: *Runner = @ptrCast(@alignCast(context.?));
+        self.mutex.lockUncancelable(self.init.io);
+        defer self.mutex.unlock(self.init.io);
+        self.log_writer.writeAll("{\"level\":\"INFO\",\"msg\":\"http_attempt\",\"attempt\":") catch return;
+        std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, self.log_writer) catch return;
+        self.log_writer.writeAll("}\n") catch return;
+        self.log_writer.flush() catch {};
+    }
     fn logLocked(self: *Runner, level: []const u8, message: []const u8, detail: []const u8) !void {
         try self.log_writer.writeAll("{\"level\":");
         try cli.writeJsonString(self.log_writer, level);
@@ -195,6 +204,7 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
     };
     runner.ctx.log_context = &runner;
     runner.ctx.log_fn = Runner.log;
+    runner.ctx.trace_fn = Runner.trace;
     var engine = scheduler.Scheduler.init(init.gpa, runner.ctx, .{ .context = &runner, .emit = Runner.event });
     defer engine.deinit();
     const input_error = try engine.run(parsed.inputs);
