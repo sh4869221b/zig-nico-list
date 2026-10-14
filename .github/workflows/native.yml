@@ -3,6 +3,14 @@ name: Native cached builds and tests
 on:
   workflow_call:
     inputs:
+      unit:
+        description: Run native ReleaseSafe unit tests
+        type: boolean
+        default: true
+      build:
+        description: Build, integrate, and check release packaging
+        type: boolean
+        default: true
       package:
         description: Prepare release inputs; caller gates publication on all jobs
         type: boolean
@@ -19,6 +27,7 @@ jobs:
   # A separate runner prevents the unit compiler from contending with the
   # cached executable build. The caller waits for BOTH jobs (and both OSes).
   unit:
+    if: inputs.unit
     name: ${{ matrix.target }} cached unit tests
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -41,8 +50,6 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Test release and cache helpers
-        run: python -m unittest discover -s scripts -p 'test_*.py' -v
       - name: Restore official Zig archive
         id: toolchain
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -51,8 +58,6 @@ jobs:
           key: zig-archive-v1-${{ runner.os }}-${{ runner.arch }}-0.17.0-${{ hashFiles('scripts/install_zig.py') }}
       - name: Install checksum-pinned Zig 0.17.0
         run: python scripts/install_zig.py
-      - name: Check Zig formatting
-        run: zig fmt --check build.zig src
       - name: Identify hosted runner image
         id: image
         run: python -c "import os; open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8').write('version=' + os.environ['ImageVersion'] + '\n')"
@@ -90,6 +95,7 @@ jobs:
           key: ${{ steps.unit-cache.outputs.cache-primary-key }}
 
   native:
+    if: inputs.build
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30

@@ -39,3 +39,9 @@ CIはWindows/Linuxのネイティブ環境でユニット・ローカルHTTP統�
 通常CIはReleaseSafeユニットテストとReleaseFast実行ファイルビルドの両方にキャッシュを使用し、OSごとに別runnerで並列実行します。キャッシュがあっても毎回新しい出力先へbuildし、commit・ソース・設定・SHA-256を検証し、統合テストを実行します。releaseもこの検証を使用します。
 
 空のlocal/global cacheで2回buildする検査は、手動専用の「Manual cold reproducibility」へ分離しました。通常CI・releaseの成功だけではcold buildの再現性を保証しません。既存v0.01のタグと配布物は変更していません。詳細は[CI検証契約](../scripts/README.md)を参照してください。
+
+## CIの起動条件
+
+通常の「Test CI」はmainへのpush、main宛PRの作成・更新・再オープン・編集、または手動実行で起動します。feature branchへのpush単独やタグpushでは起動しません。変更ファイルに応じてユニット、実行ファイル＋統合テスト、Python、Zig整形、文書チェックを選び、文書のみの変更ではZigビルドを省略します。手動実行は全検証です。集約チェック「CI」は省略されたジョブと失敗を区別します。
+
+releaseはv＋数字で始まるタグpushまたは明示的な手動実行で、変更箇所にかかわらず全検証を実施してからdraftを作成します。cold再現性検証は引き続き手動専用です。定期実行、branch protection、権限やsecretsの設定は変更していません。

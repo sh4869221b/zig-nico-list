@@ -1,0 +1,76 @@
+name: Lightweight checks
+
+# Reused by Test CI (selected checks) and Release CI (all checks).
+on:
+  workflow_call:
+    inputs:
+      format:
+        type: boolean
+        default: true
+      scripts:
+        type: boolean
+        default: true
+      docs:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    name: Python helpers (${{ matrix.runner }})
+    if: inputs.scripts
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, windows-2025]
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check Python syntax
+        run: python -m compileall -q scripts tests
+      - name: Test release, cache, and trigger helpers
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+
+  format:
+    name: Zig formatting
+    if: inputs.format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Restore official Zig archive
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .zig-downloads
+          key: zig-archive-v1-${{ runner.os }}-${{ runner.arch }}-0.17.0-${{ hashFiles('scripts/install_zig.py') }}
+      - name: Install checksum-pinned Zig 0.17.0
+        run: python scripts/install_zig.py
+      - name: Check Zig formatting
+        run: zig fmt --check build.zig src
+
+  docs:
+    name: Documentation sanity
+    if: inputs.docs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check UTF-8 and required package documents offline
+        run: python scripts/check_docs.py

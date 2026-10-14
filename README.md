@@ -38,7 +38,7 @@ python tests/integration.py zig-out/bin/zig-nico-list
 
 On Windows, use `zig-out/bin/zig-nico-list.exe` in the final command. Python 3.12+ is only needed for development tests and release packaging; the application has no third-party runtime dependencies.
 
-`ci.yml` runs cached native Linux/Windows ReleaseSafe unit tests and ReleaseFast executable builds in parallel, with integration tests on every build. `release.yml` uses the same cached checks for the exact tag commit, verifies fresh executable/source identities and archive hashes, and prepares a draft release. Cold two-build reproducibility is a separate manual `reproducibility.yml` workflow, outside normal CI; normal CI success does not establish cold-build or independent-machine reproducibility. See [CI and verification contracts](scripts/README.md).
+`ci.yml` runs on `main` pushes, PRs targeting `main`, or manual dispatch. It selects lightweight checks and cached native unit/executable jobs from the changed paths; documentation-only changes skip Zig builds. A stable `CI` check gathers the results. Manual runs execute all checks. Native executable builds always run integration tests. `release.yml` uses the same cached checks for the exact tag commit, verifies fresh executable/source identities and archive hashes, and prepares a draft release. Cold two-build reproducibility is a separate manual `reproducibility.yml` workflow, outside normal CI; normal CI success does not establish cold-build or independent-machine reproducibility. See [CI and verification contracts](scripts/README.md).
 
 ## Compatibility boundaries
 

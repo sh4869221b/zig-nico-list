@@ -2,7 +2,7 @@ name: Release CI
 
 on:
   push:
-    tags: ['v*']
+    tags: ['v[0-9]*']
   workflow_dispatch:
     inputs:
       tag:
@@ -19,15 +19,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  quality:
+    uses: ./.github/workflows/checks.yml
+    with:
+      format: true
+      scripts: true
+      docs: true
+
   native:
     uses: ./.github/workflows/native.yml
     with:
+      unit: true
+      build: true
       package: true
       release_tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
   draft:
     name: Verify artifacts and create draft release
-    needs: native
+    needs: [quality, native]
     if: github.repository == 'sh4869221b/zig-nico-list'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
