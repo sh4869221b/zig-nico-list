@@ -11,7 +11,7 @@ Verify the archive against `SHA256SUMS` before extracting. The executable needs 
 - Windows: extract the ZIP, then run `.\zig-nico-list.exe --help` in PowerShell.
 - Linux: extract the tarball, then run `./zig-nico-list --help`.
 
-The release version is **v0.02**. Linux builds target baseline x86-64 and use static linking. Windows builds target baseline x86-64 Windows; both platforms are tested natively by CI.
+The release version is **v0.03**. Linux builds target baseline x86-64 and use static linking. Windows builds target baseline x86-64 Windows; both platforms are tested natively by CI.
 
 ## Usage
 

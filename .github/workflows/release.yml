@@ -9,7 +9,7 @@ on:
         description: Version tag to create after all native checks pass
         required: true
         type: string
-        default: v0.02
+        default: v0.03
 
 permissions:
   contents: read
