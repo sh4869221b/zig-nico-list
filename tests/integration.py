@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.requests.append(page)
             attempt = len(self.server.requests)
         status, payload, headers, stall = self.server.reply(page, attempt, self.path)
+        if status == 0:
+            # Deterministic transport failure before any response headers.
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.close_connection = True
+            return
         try:
             self.send_response(status)
             self.send_header('Content-Length', str(len(payload)))
@@ -223,13 +229,82 @@ class CliIntegration(unittest.TestCase):
             self.assertEqual(server.requests, [1])
             self.assertEqual(result.stdout, '')
 
-    def test_timeout_discards_target(self):
+    def test_timeout_reports_failed_target(self):
         with fixture(lambda *_: (200, body(), {}, True)) as server:
             result = command(server, '--timeout', '100ms', '--json', USER)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout)['items'], [])
+            self.assertEqual(result.returncode, 1, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output['items'], [])
+            self.assertEqual(output['targets'][0]['error'], 'Timeout')
+            self.assertIn('fetch_ok=0 fetch_err=1', result.stderr)
             self.assertEqual(server.requests, [1])
             self.assertIn('failed to read response body', result.stderr)
+
+    def test_later_page_timeout_preserves_prefix_and_reports_failure(self):
+        for flags in ([], ['--no-sort'], ['--json'], ['--best-effort'], ['-P2', '--json']):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as tmp:
+                def reply(page, attempt, path):
+                    return 200, body((f'sm{page}',), total=200), {}, page == 2
+                with fixture(reply) as server:
+                    logfile = Path(tmp) / 'failure.jsonl'
+                    result = command(server, '--timeout', '100ms', '--logfile',
+                                     str(logfile), '--http-metrics', *flags, USER)
+                    self.assertEqual(result.returncode, int('--best-effort' not in flags), result.stderr)
+                    if '--json' in flags:
+                        output = json.loads(result.stdout)
+                        self.assertEqual(output['items'], ['sm1'])
+                        self.assertEqual(output['targets'][0]['error'], 'Timeout')
+                    else:
+                        self.assertEqual(result.stdout, 'sm1\n')
+                    self.assertIn('fetch_ok=0 fetch_err=1 output_count=1', result.stderr)
+                    logs = [json.loads(line) for line in logfile.read_text().splitlines()]
+                    self.assertTrue(any(row['level'] == 'ERROR' and row.get('msg') == 'failed to get video list' for row in logs))
+                    metrics = next(row['http']['metrics'] for row in logs if row.get('msg') == 'http_metrics')
+                    self.assertEqual(metrics['pages'], 2)
+                    self.assertEqual(metrics['page_success'], 1)
+                    self.assertEqual(metrics['page_errors'], 1)
+                    self.assertEqual(metrics['transport_errors'], 1)
+                    self.assertEqual(metrics['retries'], 0)
+                    self.assertEqual(server.requests, [1, 2])
+
+    def test_transport_retry_recovers_and_exhaustion_fails(self):
+        for recover in (True, False):
+            with self.subTest(recover=recover):
+                def reply(page, attempt, path):
+                    failed = page == 2 and (not recover or attempt == 2)
+                    return (0 if failed else 200), body((f'sm{page}',), total=200), {}, False
+                with fixture(reply) as server:
+                    result = command(server, '-P2', '--http-metrics', USER)
+                    self.assertEqual(result.returncode, 0 if recover else 1, result.stderr)
+                    self.assertEqual(result.stdout, 'sm1\nsm2\n' if recover else 'sm1\n')
+                    self.assertIn('fetch_ok=1 fetch_err=0' if recover else 'fetch_ok=0 fetch_err=1', result.stderr)
+                    self.assertEqual(server.requests, [1, 2, 2])
+                    metrics = next(json.loads(line)['http']['metrics'] for line in result.stderr.splitlines()
+                                   if line.startswith('{') and json.loads(line).get('msg') == 'http_metrics')
+                    self.assertEqual(metrics['attempts'], 3)
+                    self.assertEqual(metrics['retries'], 1)
+                    self.assertEqual(metrics['page_errors'], 0 if recover else 1)
+                    self.assertEqual(metrics['transport_errors'], 1 if recover else 2)
+
+    def test_other_http_status_is_counted_and_logged(self):
+        for recover in (True, False):
+            with self.subTest(recover=recover):
+                def reply(page, attempt, path):
+                    if not recover or attempt == 1:
+                        return 403, b'', {}, False
+                    return 200, body(('sm1',), total=1), {}, False
+                with fixture(reply) as server:
+                    result = command(server, '-P2', '--http-metrics', USER)
+                    self.assertEqual(result.returncode, 0 if recover else 1, result.stderr)
+                    logs = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+                    status_logs = [row for row in logs if row.get('msg') == 'HTTP attempt returned error status']
+                    self.assertEqual(len(status_logs), 1 if recover else 2)
+                    self.assertTrue(all(row.get('error') == '403' for row in status_logs), status_logs)
+                    metrics = next(row['http']['metrics'] for row in logs if row.get('msg') == 'http_metrics')
+                    self.assertEqual(metrics['http_other'], 1 if recover else 2)
+                    self.assertEqual(metrics['retries'], 1)
+                    self.assertEqual(metrics['attempts'], sum(metrics[key] for key in
+                                     ('http_200', 'http_404', 'http_429', 'http_5xx', 'http_other', 'transport_errors')))
 
     def test_logfile_keeps_stdout_clean(self):
         with fixture() as server, tempfile.TemporaryDirectory() as tmp:

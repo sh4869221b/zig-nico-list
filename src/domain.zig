@@ -34,6 +34,7 @@ pub const Metrics = struct {
     http_404: u64 = 0,
     http_429: u64 = 0,
     http_5xx: u64 = 0,
+    http_other: u64 = 0,
     transport_errors: u64 = 0,
     decode_errors: u64 = 0,
     body_bytes: u64 = 0,
@@ -318,7 +319,7 @@ fn requestTimed(ctx: *Context, url: []const u8, attempt_info: *Attempt) !Respons
             ctx.temporary.free(value.body);
         } else |_| {}
         // Client timeouts are overload feedback. Only caller cancellation is
-        // neutral; fetchPage maps Timeout to an empty result after observation.
+        // neutral. Preserve Timeout as a terminal page failure after observation.
         return if (outcome == .expired) error.Timeout else error.Canceled;
     }
     return response;
@@ -434,7 +435,9 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
             404 => c.metrics.http_404 += 1,
             429 => c.metrics.http_429 += 1,
             500...599 => c.metrics.http_5xx += 1,
-            else => {},
+            else => if (!transport_error) {
+                c.metrics.http_other += 1;
+            },
         }
         if (transport_error) c.metrics.transport_errors += 1;
         const caller_canceled = canceled.load(.acquire) or if (result) |r| (if (r.body_error) |e| e == error.Canceled else false) else |e| e == error.Canceled;
@@ -471,11 +474,17 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
                 success = true;
                 return .{ .parsed = parsed };
             }
+            var status_text: [5]u8 = undefined;
+            ctx.log("WARN", "HTTP attempt returned error status", std.fmt.bufPrint(&status_text, "{d}", .{response.status}) catch unreachable);
             status_error = response.status;
             retry_after = response.retry_after;
             last_error = error.UnexpectedStatus;
         } else |err| {
-            if (err == error.Canceled or err == error.Timeout) return error.Canceled;
+            // The supervisor cancels and joins this page job at its deadline.
+            // It cannot safely retry in the same future: another blocked attempt
+            // would have no deadline supervisor while that join is in progress.
+            // A client timeout is a failure, never successful caller cancellation.
+            if (err == error.Canceled or err == error.Timeout) return err;
             last_error = err;
             status_error = 0;
         }
