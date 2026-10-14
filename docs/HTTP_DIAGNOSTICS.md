@@ -96,8 +96,8 @@ those questions before another transport or policy change.
 
 ## Next measurement
 
-Build this branch and record its commit and binary hash: the development build
-still reports v0.02 because this change does not create a release.
+Build v0.03 or later and record its commit and binary hash so that each
+measurement can be matched to its exact executable.
 
 ```sh
 zig build -Doptimize=fast -Dcpu=baseline
@@ -124,8 +124,8 @@ batch. Do not repeatedly probe denied URLs or alter identity to bypass a 403.
 Use native Windows Zig 0.17.0 in a checkout of `fix/http-stall-diagnostics`.
 The Linux fixture tests do not establish Windows runtime behavior; run the
 Windows unit/integration commands below before measuring the live workload.
-Neither these builds nor the source bundle publish a release. The executable
-still reports v0.02, so retain the commit and SHA-256 as its identity.
+These measurement builds do not publish a release. Verify that the executable
+reports v0.03 or later, and retain the commit and SHA-256 as its identity.
 
 ```powershell
 zig version # must print 0.17.0
