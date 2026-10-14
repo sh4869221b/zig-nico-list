@@ -64,7 +64,7 @@ const Runner = struct {
                 self.total = self.counts.total;
                 if (cli.parseTarget(input) != null) self.counts.valid += 1 else {
                     self.counts.invalid += 1;
-                    try self.invalid.append(self.ctx.allocator, input);
+                    try self.invalid.append(self.ctx.result_allocator, input);
                     try self.logLocked("WARN", "invalid input", input);
                     self.completed += 1;
                     self.progress();
@@ -99,9 +99,9 @@ const Runner = struct {
         }
     }
     fn complete(self: *Runner, result: *cli.TargetResult) !void {
-        try self.results.append(self.ctx.allocator, result);
+        try self.results.append(self.ctx.result_allocator, result);
         if (self.cfg.no_sort and !self.cfg.json and result.error_message.len > 0)
-            result.error_message = try self.ctx.allocator.dupe(u8, result.error_message);
+            result.error_message = try self.ctx.result_allocator.dupe(u8, result.error_message);
         self.mutex.lockUncancelable(self.init.io);
         defer self.mutex.unlock(self.init.io);
         if (result.error_message.len > 0) {
@@ -112,12 +112,12 @@ const Runner = struct {
         if (self.cfg.no_sort and !self.cfg.json and self.output_error == null) {
             for (result.items) |id| {
                 if (self.cfg.dedupe) {
-                    const item = self.seen.getOrPut(self.ctx.allocator, id) catch |err| {
+                    const item = self.seen.getOrPut(self.ctx.result_allocator, id) catch |err| {
                         self.output_error = err;
                         break;
                     };
                     if (item.found_existing) continue;
-                    item.key_ptr.* = self.ctx.allocator.dupe(u8, id) catch |err| {
+                    item.key_ptr.* = self.ctx.result_allocator.dupe(u8, id) catch |err| {
                         self.output_error = err;
                         break;
                     };
@@ -189,7 +189,7 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
         .out = out,
         .err = err,
         .log_writer = log_writer,
-        .ctx = .{ .allocator = a, .temporary = init.gpa, .io = init.io, .cfg = cfg, .control = &control, .client = &client },
+        .ctx = .{ .result_allocator = a, .temporary = init.gpa, .io = init.io, .cfg = cfg, .control = &control, .client = &client },
 
         .show_progress = !cfg.no_progress and (cfg.progress or try Io.File.stderr().isTty(init.io)),
     };
@@ -216,15 +216,8 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
     try err.print("summary inputs={d} valid={d} invalid={d} fetch_ok={d} fetch_err={d} output_count={d}\n", .{ counts.total, counts.valid, counts.invalid, runner.fetch_ok, runner.fetch_err, runner.output_count });
     if (cfg.http_metrics) {
         try log_writer.writeAll("{\"level\":\"INFO\",\"msg\":\"http_metrics\",\"http\":");
-        var adaptive_snapshot = control.controller.snapshot(domain.now(init.io));
-        adaptive_snapshot.pending = @intCast(control.pending + control.worker_pending);
-        adaptive_snapshot.in_flight = @intCast(control.in_flight);
-        try std.json.Stringify.value(.{
-            .admission = .{ .hard_max = cfg.concurrency_http, .limit = control.httpLimit(), .reserved = control.reserved, .peak_reserved = control.peak_reserved, .pending = control.pending, .peak_pending = control.peak_pending },
-            .metrics = control.metrics,
-            .elapsed_seconds = @as(f64, @floatFromInt(domain.now(init.io) - control.started)) / 1e9,
-            .adaptive = if (cfg.concurrency_adaptive) adaptive_snapshot.jsonView() else null,
-        }, .{ .emit_null_optional_fields = false }, log_writer);
+        const snapshot = control.snapshot();
+        try std.json.Stringify.value(snapshot.jsonView(), .{ .emit_null_optional_fields = false }, log_writer);
         try log_writer.writeAll("}\n");
     }
     try log_writer.flush();

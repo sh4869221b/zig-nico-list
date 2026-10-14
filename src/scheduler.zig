@@ -9,6 +9,12 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 pub const Event = union(enum) { input: []const u8, complete: *cli.TargetResult };
+/// Events are emitted synchronously by the coordinator, never by page jobs.
+/// Input strings and result records are borrowed until Scheduler.deinit. Page
+/// ID/error storage also lives until deinit for buffered output, but in no-sort
+/// non-JSON mode it is released as soon as the complete callback returns. A sink
+/// must copy any such bytes it retains (for example dedupe keys or errors).
+/// The sink may replace error_message with its own durable copy before return.
 pub const Sink = struct {
     context: *anyopaque,
     emit: *const fn (*anyopaque, Event) anyerror!void,
@@ -63,7 +69,7 @@ pub const Scheduler = struct {
                 job.scheduler.wake();
             }
             var context = job.scheduler.ctx;
-            context.allocator = job.arena.allocator();
+            context.result_allocator = job.arena.allocator();
             context.deadline = &job.deadline;
             return domain.fetchPage(&context, job.target.result.target, job.number);
         }
@@ -133,15 +139,6 @@ pub const Scheduler = struct {
         self.epoch +%= 1;
         self.changed.broadcast(self.ctx.io);
         self.mutex.unlock(self.ctx.io);
-    }
-    fn limits(self: *Scheduler) struct { targets: usize, pages: usize } {
-        const c = self.ctx.control;
-        c.mutex.lockUncancelable(self.ctx.io);
-        defer c.mutex.unlock(self.ctx.io);
-        return .{
-            .targets = c.workerLimit(if (self.ctx.cfg.concurrency_adaptive and !self.ctx.cfg.target_explicit) 0 else self.ctx.cfg.concurrency_targets),
-            .pages = c.workerLimit(if (self.ctx.cfg.concurrency_adaptive and !self.ctx.cfg.page_explicit) 0 else self.ctx.cfg.concurrency_pages),
-        };
     }
     fn launch(self: *Scheduler, target: *Target) !void {
         const job = try self.allocator.create(Job);
@@ -235,7 +232,7 @@ pub const Scheduler = struct {
                 if (target.running == 0 and (cancel_all or target.next_page > target.last_page or target.next_page >= target.stop_before))
                     try self.finish(target);
             }
-            const budget = self.limits();
+            const budget = self.ctx.control.workerBudgets();
             if (!cancel_all) {
                 self.mutex.lockUncancelable(self.ctx.io);
                 const value = self.pending_input;
@@ -271,10 +268,7 @@ pub const Scheduler = struct {
             self.mutex.lockUncancelable(self.ctx.io);
             const has_pending = self.pending_input != null;
             self.mutex.unlock(self.ctx.io);
-            const c = self.ctx.control;
-            c.mutex.lockUncancelable(self.ctx.io);
-            c.worker_pending = waiting_pages + @as(usize, @intFromBool(has_pending));
-            c.mutex.unlock(self.ctx.io);
+            self.ctx.control.setWorkerPending(waiting_pages + @as(usize, @intFromBool(has_pending)));
             if (self.active == 0 and (cancel_all or input_done and !has_pending)) break;
             // Completion notifications wake immediately. This bounded wait also
             // supervises request deadlines and the signal-safe cancellation bit.
@@ -293,7 +287,7 @@ pub const Scheduler = struct {
             self.mutex.unlock(self.ctx.io);
         }
         self.input_future.?.await(self.ctx.io);
-        self.ctx.control.worker_pending = 0;
+        self.ctx.control.setWorkerPending(0);
         return self.input_error;
     }
 };
@@ -306,7 +300,7 @@ test "ordered commit ignores a later canceled page after an empty terminal page"
     var client: std.http.Client = .{ .allocator = a, .io = io };
     defer client.deinit();
     var unused: u8 = 0;
-    var engine = Scheduler.init(a, .{ .allocator = a, .temporary = a, .io = io, .cfg = &cfg, .control = &control, .client = &client }, .{ .context = &unused, .emit = struct {
+    var engine = Scheduler.init(a, .{ .result_allocator = a, .temporary = a, .io = io, .cfg = &cfg, .control = &control, .client = &client }, .{ .context = &unused, .emit = struct {
         fn emit(_: *anyopaque, _: Event) anyerror!void {}
     }.emit });
     defer engine.deinit();
