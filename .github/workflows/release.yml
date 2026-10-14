@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Version tag to create after both native jobs pass
+        description: Version tag to create after all native checks pass
         required: true
         type: string
         default: v0.01
