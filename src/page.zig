@@ -1,7 +1,7 @@
 //! API wire schema and response filtering. Keep the complete NicoData schema
 //! even when only a subset of its fields is used by the collector.
 const std = @import("std");
-const cli = @import("cli.zig");
+const date_time = @import("date_time.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Page = struct {
@@ -155,7 +155,7 @@ const Decoder = struct {
                 else => unreachable,
             };
             defer if (token == .allocated_string) self.allocator.free(text);
-            const unix = cli.parseTimestamp(text) catch return error.UnexpectedToken;
+            const unix = date_time.parseTimestamp(text) catch return error.UnexpectedToken;
             if (Projected != void) projection.unix = unix;
             return;
         }

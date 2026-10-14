@@ -11,6 +11,8 @@ response representation, allocator boundaries, and sort pipeline are rebuilt.
 
 - `main.zig`: bootstrapping, signal installation, single output owner, diagnostics.
 - `cli.zig`: CLI contract, input scanner, target parsing, output schema.
+- `date_time.zig`: shared pure date/timestamp parsing and its Go-compatible
+  calendar/offset rules; API decoding does not depend on the CLI module.
 - `scheduler.zig`: target/page state, bounded input mailbox, page ordering,
   termination, task lifecycle, deadline supervision, target-completion events.
 - `domain.zig`: HTTP requests, retries, rate/admission policy, metrics, typed
@@ -19,6 +21,12 @@ response representation, allocator boundaries, and sort pipeline are rebuilt.
   selected-ID ownership and filters.
 - `id_order.zig`: borrowed sort-key decoration, ordering, scratch allocation.
 - `adaptive.zig`: pure policy state machine, unchanged, checked against Go.
+
+The coordinator uses `Control.workerBudgets()` and `setWorkerPending()` rather
+than managing Control's mutex or counters. Diagnostics use a detached
+`Control.snapshot()`; its `jsonView()` borrows only the snapshot's own adaptive
+decision buffer. Admission synchronization and snapshot assembly stay within
+`domain.zig`, while output remains in `main.zig`.
 
 ## Flat work graph
 
@@ -67,6 +75,16 @@ bodies are closed without a blocking drain, as in the first port.
   The coordinator reads it only after join and retains ownership through output.
 - Temporary allocator: HTTP body and parser scratch, freed per operation.
 - Output scratch: flattened slice and decorated sort keys, released after use.
+
+`Context.result_allocator` names the owner of retained IDs and errors. Each job
+replaces it with its exclusive arena; the coordinator's copy uses the invocation
+arena. `Context.temporary` is for operation-local bodies and parsing scratch.
+
+`Sink.emit` is synchronous and called only by the coordinator. Input strings and
+result records are borrowed until scheduler teardown. Buffered page bytes share
+that lifetime, but no-sort non-JSON page bytes are released immediately after the
+completion callback. The sink copies any dedupe keys or errors it must retain
+before returning, and may replace the result's error slice with its durable copy.
 
 No two jobs mutate one ArenaAllocator. Unordered non-JSON target output is
 emitted at completion, then its page arenas and ID arrays are released. Input

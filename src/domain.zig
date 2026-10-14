@@ -2,6 +2,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const page = @import("page.zig");
 const adaptive = @import("adaptive.zig");
+const date_time = @import("date_time.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -64,6 +65,42 @@ pub const Control = struct {
     started: i64,
     const Waiter = struct { next: ?*Waiter = null, prev: ?*Waiter = null };
 
+    pub const WorkerBudgets = struct { targets: usize, pages: usize };
+    pub const AdmissionSnapshot = struct {
+        hard_max: i64,
+        limit: usize,
+        reserved: usize,
+        peak_reserved: usize,
+        pending: usize,
+        peak_pending: usize,
+    };
+    /// Detached values, including the adaptive decision buffer. No Control
+    /// lock is needed while reading or serializing this snapshot.
+    pub const Snapshot = struct {
+        admission: AdmissionSnapshot,
+        metrics: Metrics,
+        elapsed_seconds: f64,
+        adaptive: ?adaptive.Snapshot,
+
+        pub const JsonView = struct {
+            admission: AdmissionSnapshot,
+            metrics: Metrics,
+            elapsed_seconds: f64,
+            adaptive: ?adaptive.JsonSnapshot,
+        };
+
+        /// Only the decision slice is borrowed; keep this snapshot alive until
+        /// serialization completes. Omit null fields to retain the CLI schema.
+        pub fn jsonView(self: *const Snapshot) JsonView {
+            return .{
+                .admission = self.admission,
+                .metrics = self.metrics,
+                .elapsed_seconds = self.elapsed_seconds,
+                .adaptive = if (self.adaptive) |*value| value.jsonView() else null,
+            };
+        }
+    };
+
     pub fn init(io: Io, cfg: *const cli.Config) Control {
         var interval = cfg.min_interval_ns;
         if (cfg.rate_limit > 0 and std.math.isFinite(cfg.rate_limit)) {
@@ -73,10 +110,43 @@ pub const Control = struct {
         const ts = now(io);
         return .{ .io = io, .cfg = cfg, .interval = interval, .controller = .init(@intCast(cfg.concurrency_http), ts), .started = ts };
     }
-    pub fn workerLimit(self: *Control, fixed: i64) usize {
+    /// The coordinator reads both budgets under one lock. Explicit overrides
+    /// remain independent of automatic adaptive budgets and HTTP admission.
+    pub fn workerBudgets(self: *Control) WorkerBudgets {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return .{
+            .targets = self.workerLimit(if (self.cfg.concurrency_adaptive and !self.cfg.target_explicit) 0 else self.cfg.concurrency_targets),
+            .pages = self.workerLimit(if (self.cfg.concurrency_adaptive and !self.cfg.page_explicit) 0 else self.cfg.concurrency_pages),
+        };
+    }
+    pub fn setWorkerPending(self: *Control, count: usize) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.worker_pending = count;
+    }
+    pub fn snapshot(self: *Control) Snapshot {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const timestamp = now(self.io);
+        var policy: ?adaptive.Snapshot = null;
+        if (self.cfg.concurrency_adaptive) {
+            policy = self.controller.snapshot(timestamp);
+            policy.?.pending = @intCast(self.pending + self.worker_pending);
+            policy.?.in_flight = @intCast(self.in_flight);
+        }
+        return .{
+            .admission = .{ .hard_max = self.cfg.concurrency_http, .limit = self.httpLimit(), .reserved = self.reserved, .peak_reserved = self.peak_reserved, .pending = self.pending, .peak_pending = self.peak_pending },
+            .metrics = self.metrics,
+            .elapsed_seconds = @as(f64, @floatFromInt(timestamp - self.started)) / 1e9,
+            .adaptive = policy,
+        };
+    }
+    // Internal limit helpers require the caller to hold mutex.
+    fn workerLimit(self: *Control, fixed: i64) usize {
         return @intCast(if (fixed > 0) fixed else if (self.cfg.concurrency_adaptive) self.controller.limit else 1);
     }
-    pub fn httpLimit(self: *Control) usize {
+    fn httpLimit(self: *Control) usize {
         return @intCast(if (self.cfg.concurrency_adaptive and !self.cfg.http_explicit) self.controller.limit else self.cfg.concurrency_http);
     }
     fn remove(self: *Control, waiter: *Waiter) void {
@@ -168,7 +238,10 @@ pub const Deadline = struct {
 };
 
 pub const Context = struct {
-    allocator: Allocator,
+    /// Retained IDs/errors belong to the caller. A page job replaces this with
+    /// its exclusive arena; the coordinator's context uses the invocation arena.
+    result_allocator: Allocator,
+    /// Response bodies and parser scratch are freed before the operation ends.
     temporary: Allocator,
     io: Io,
     cfg: *const cli.Config,
@@ -286,7 +359,7 @@ fn parseHTTPDate(value: []const u8) !i64 {
     if (year.len == 2) year_no += if (year_no >= 69) @as(u16, 1900) else 2000;
     var tmp: [64]u8 = undefined;
     const iso = try std.fmt.bufPrint(&tmp, "{d:0>4}-{d:0>2}-{d:0>2}T{s}Z", .{ year_no, month_no, try std.fmt.parseInt(u8, day, 10), time });
-    return cli.parseTimestamp(iso);
+    return date_time.parseTimestamp(iso);
 }
 
 fn retryDelay(attempt_index: i64) i64 {
@@ -387,7 +460,7 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
                 return e;
             }
             if (response.status == 200) {
-                const parsed = page.parseWithTemporary(ctx.allocator, ctx.temporary, response.body, target.type == .mylist, ctx.cfg.comment, ctx.cfg.after_unix, ctx.cfg.before_unix_exclusive) catch |err| {
+                const parsed = page.parseWithTemporary(ctx.result_allocator, ctx.temporary, response.body, target.type == .mylist, ctx.cfg.comment, ctx.cfg.after_unix, ctx.cfg.before_unix_exclusive) catch |err| {
                     c.mutex.lockUncancelable(ctx.io);
                     c.metrics.decode_errors += 1;
                     c.mutex.unlock(ctx.io);
@@ -414,7 +487,7 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
         c.metrics.backoff_wait_ns +|= @intCast(delay);
         c.mutex.unlock(ctx.io);
     }
-    if (status_error > 0) return .{ .parsed = .{ .ids = &.{}, .item_count = 0, .status = status_error, .total_count = null }, .failure = try std.fmt.allocPrint(ctx.allocator, "unexpected status: {d}", .{status_error}) };
+    if (status_error > 0) return .{ .parsed = .{ .ids = &.{}, .item_count = 0, .status = status_error, .total_count = null }, .failure = try std.fmt.allocPrint(ctx.result_allocator, "unexpected status: {d}", .{status_error}) };
     return last_error;
 }
 
@@ -427,6 +500,77 @@ test "HTTP Retry-After IMF date" {
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sun, 06 Nov 1994 08:49:37 GMT"));
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sunday, 06-Nov-94 08:49:37 GMT"));
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sun Nov  6 08:49:37 1994"));
+}
+
+test "Control APIs preserve independent fixed and adaptive budgets" {
+    const Case = struct { cfg: cli.Config, targets: usize, pages: usize, http: usize };
+    const cases = [_]Case{
+        .{ .cfg = .{}, .targets = 3, .pages = 1, .http = 0 },
+        .{ .cfg = .{ .concurrency_adaptive = true }, .targets = 5, .pages = 5, .http = 5 },
+        .{ .cfg = .{ .concurrency_adaptive = true, .target_explicit = true }, .targets = 3, .pages = 5, .http = 5 },
+        .{ .cfg = .{ .concurrency_adaptive = true, .page_explicit = true }, .targets = 5, .pages = 1, .http = 5 },
+        .{ .cfg = .{ .concurrency_adaptive = true, .target_explicit = true, .page_explicit = true, .http_explicit = true }, .targets = 3, .pages = 1, .http = 0 },
+        .{ .cfg = .{ .concurrency_adaptive = true, .concurrency_http = 8, .http_explicit = true }, .targets = 5, .pages = 5, .http = 8 },
+    };
+    for (cases) |case| {
+        var control = Control.init(std.testing.io, &case.cfg);
+        control.controller.limit = 5;
+        const budgets = control.workerBudgets();
+        try std.testing.expectEqual(case.targets, budgets.targets);
+        try std.testing.expectEqual(case.pages, budgets.pages);
+        try std.testing.expectEqual(case.http, control.snapshot().admission.limit);
+    }
+}
+
+test "Control snapshot owns diagnostics and combines pending worker demand" {
+    const cfg: cli.Config = .{ .concurrency_adaptive = true };
+    var control = Control.init(std.testing.io, &cfg);
+    control.pending = 2;
+    control.in_flight = 3;
+    control.metrics.attempts = 7;
+    control.controller.throttle(now(std.testing.io), 1_000_000_000, control.controller.generation);
+    control.setWorkerPending(4);
+    const snapshot = control.snapshot();
+    const current = snapshot.adaptive.?.current;
+    try std.testing.expectEqual(@as(usize, 2), snapshot.admission.pending);
+    try std.testing.expectEqual(@as(isize, 6), snapshot.adaptive.?.pending);
+    try std.testing.expectEqual(@as(isize, 3), snapshot.adaptive.?.in_flight);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.adaptive.?.decision_count);
+    const reason = snapshot.adaptive.?.decisions()[0].reason;
+
+    control.setWorkerPending(0);
+    control.metrics.attempts = 99;
+    control.controller.limit = 1;
+    control.controller.decision_buffer[0].reason = "changed after snapshot";
+    try std.testing.expectEqual(@as(isize, 2), control.snapshot().adaptive.?.pending);
+    try std.testing.expectEqual(@as(u64, 7), snapshot.metrics.attempts);
+    try std.testing.expectEqual(current, snapshot.adaptive.?.current);
+    try std.testing.expectEqualStrings(reason, snapshot.adaptive.?.decisions()[0].reason);
+    try std.testing.expectEqualStrings(reason, snapshot.jsonView().adaptive.?.decisions[0].reason);
+}
+
+test "Control snapshot JSON keeps metrics schema and optional adaptive view" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |enabled| {
+        const cfg: cli.Config = .{ .concurrency_adaptive = enabled };
+        var control = Control.init(std.testing.io, &cfg);
+        const snapshot = control.snapshot();
+        const text = try std.json.Stringify.valueAlloc(a, snapshot.jsonView(), .{ .emit_null_optional_fields = false });
+        defer a.free(text);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try std.testing.expectEqual(@as(usize, if (enabled) 4 else 3), object.count());
+        try std.testing.expectEqual(@as(usize, 6), object.get("admission").?.object.count());
+        try std.testing.expectEqual(@as(i64, 0), object.get("metrics").?.object.get("attempts").?.integer);
+        try std.testing.expect(object.get("elapsed_seconds") != null);
+        if (enabled) {
+            const policy = object.get("adaptive").?.object;
+            try std.testing.expectEqual(@as(usize, 0), policy.get("decisions").?.array.items.len);
+            try std.testing.expect(policy.get("decision_buffer") == null);
+            try std.testing.expect(policy.get("decision_count") == null);
+        } else try std.testing.expect(object.get("adaptive") == null);
+    }
 }
 
 test "deadline claims are attempt-specific and late completion is rejected" {

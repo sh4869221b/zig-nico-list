@@ -112,6 +112,49 @@ class CliIntegration(unittest.TestCase):
             self.check_ok(command(server, '--url', '--no-sort', USER),
                           'https://www.nicovideo.jp/watch/sm10\nhttps://www.nicovideo.jp/watch/sm2\n')
 
+    def test_no_sort_dedupe_across_completed_targets(self):
+        with fixture() as server:
+            result = command(server, '-T1', '--no-sort', '--dedupe', USER, MYLIST)
+            self.check_ok(result, 'sm10\nsm2\n')
+            self.assertIn('fetch_ok=2 fetch_err=0 output_count=2', result.stderr)
+
+    def test_no_sort_retains_error_summary_after_later_target(self):
+        def reply(page, attempt, path):
+            if '/users/' in path:
+                return 500, b'', {}, False
+            return 200, body(mylist=True) if page == 1 else body((), mylist=True), {}, False
+        with fixture(reply) as server:
+            result = command(server, '-T1', '--no-sort', '--retries', '1', USER, MYLIST)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stdout, 'sm10\nsm2\n')
+            self.assertIn('fetch_ok=1 fetch_err=1 output_count=2', result.stderr)
+            self.assertTrue(result.stderr.endswith('Error: unexpected status: 500\n'))
+
+    def test_http_metrics_snapshot_schema(self):
+        for adaptive in (False, True):
+            with self.subTest(adaptive=adaptive), fixture() as server:
+                flags = ['-A'] if adaptive else []
+                result = command(server, *flags, '-T1', '-P1', '-H2', '--http-metrics', USER)
+                self.check_ok(result, 'sm2\nsm10\n')
+                http = next(json.loads(line)['http'] for line in result.stderr.splitlines()
+                            if line.startswith('{') and json.loads(line).get('msg') == 'http_metrics')
+                self.assertEqual(set(http), {'admission', 'metrics', 'elapsed_seconds'} |
+                                 ({'adaptive'} if adaptive else set()))
+                self.assertEqual(set(http['admission']),
+                                 {'hard_max', 'limit', 'reserved', 'peak_reserved', 'pending', 'peak_pending'})
+                self.assertEqual(http['admission']['hard_max'], 2)
+                self.assertEqual(http['admission']['limit'], 2)
+                self.assertEqual(http['admission']['reserved'], 0)
+                self.assertEqual(http['admission']['pending'], 0)
+                self.assertEqual(http['metrics']['attempts'], 2)
+                self.assertEqual(http['metrics']['pages'], 2)
+                if adaptive:
+                    self.assertEqual(http['adaptive']['pending'], 0)
+                    self.assertEqual(http['adaptive']['in_flight'], 0)
+                    self.assertIsInstance(http['adaptive']['decisions'], list)
+                    self.assertNotIn('decision_buffer', http['adaptive'])
+                    self.assertNotIn('decision_count', http['adaptive'])
+
     def test_stdin_and_file(self):
         with fixture() as server, tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'inputs.txt'
