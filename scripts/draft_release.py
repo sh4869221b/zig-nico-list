@@ -8,8 +8,13 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import tarfile
+import zipfile
 
 from package_release import TAG_PATTERN
+from build_metadata import source_identity, validate_info
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def gh(*arguments):
@@ -42,7 +47,10 @@ def ensure_tag(repository, tag, commit, allow_create):
         raise SystemExit("Remote tag is missing or points to a different commit; it will not be rewritten")
 
 
-def collect_artifacts(directory, tag, commit):
+def collect_artifacts(directory, tag, commit, *, identity=None):
+    identity = identity or source_identity(ROOT)
+    if identity[0] != commit:
+        raise SystemExit("Release checkout belongs to a different commit")
     artifacts, sums = [], []
     for target, extension in (("linux-x86_64", ".tar.gz"), ("windows-x86_64", ".zip")):
         folder = directory / target
@@ -53,13 +61,36 @@ def collect_artifacts(directory, tag, commit):
         for key, value in {"tag": tag, "source_commit": commit, "target": target, "archive": expected, "zig_version": "0.17.0"}.items():
             if info.get(key) != value:
                 raise SystemExit(f"Unexpected {key} in {target} build information")
-        if not re.fullmatch(r"[0-9a-f]{64}", info.get("binary_sha256", "")) or info["binary_sha256"] != info.get("repeat_binary_sha256"):
-            raise SystemExit(f"Repeat-build verification missing for {target}")
+        validate_info(info, identity, target)
+        if info["binary_version"] != f"zig-nico-list version {tag}":
+            raise SystemExit(f"Executable version does not match {tag}")
         artifact = folder / expected
         with artifact.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         if digest != info.get("sha256"):
             raise SystemExit(f"Archive checksum mismatch for {target}")
+        prefix = expected.removesuffix(extension)
+        expected_names = {f"{prefix}/{name}" for name in
+                          (info["binary"], "BUILD-INFO.json", "README.md", "LICENSE", "LICENSE-ZIG.txt")}
+        if extension == ".zip":
+            with zipfile.ZipFile(artifact) as bundle:
+                if set(bundle.namelist()) != expected_names or len(bundle.namelist()) != len(expected_names):
+                    raise SystemExit("Unexpected release archive payload")
+                embedded_info = bundle.read(f"{prefix}/BUILD-INFO.json")
+                binary = bundle.read(f"{prefix}/{info['binary']}")
+        else:
+            with tarfile.open(artifact, "r:gz") as bundle:
+                members = bundle.getmembers()
+                if ({m.name for m in members} != expected_names or len(members) != len(expected_names)
+                        or not all(m.isfile() for m in members)):
+                    raise SystemExit("Unexpected release archive payload")
+                embedded_info = bundle.extractfile(f"{prefix}/BUILD-INFO.json").read()
+                binary = bundle.extractfile(f"{prefix}/{info['binary']}").read()
+        expected_info = {key: value for key, value in info.items() if key not in {"tag", "archive", "sha256"}}
+        if json.loads(embedded_info) != expected_info:
+            raise SystemExit("Embedded build information differs from artifact manifest")
+        if not binary or hashlib.sha256(binary).hexdigest() != info["binary_sha256"]:
+            raise SystemExit("Archived executable checksum differs from build information")
         artifacts.append(str(artifact))
         sums.append(f"{digest}  {expected}\n")
     return artifacts, sums
@@ -78,7 +109,7 @@ def main():
     if commit != os.environ["GITHUB_SHA"] or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != commit:
         raise SystemExit("Release checkout does not match the tested commit")
     artifacts, sums = collect_artifacts(Path("release-input"), tag, commit)
-    # This function is reached only after both native jobs and artifact checks pass.
+    # This function is reached only after all native jobs and artifact checks pass.
     ensure_tag(repository, tag, commit, allow_create=event == "workflow_dispatch")
     with tempfile.TemporaryDirectory(prefix="release-metadata-") as temporary:
         checksums = Path(temporary) / "SHA256SUMS"
@@ -87,11 +118,13 @@ def main():
         notes.write_text(
             f"Source commit: `{commit}`\n\n"
             "Native x86_64 Linux and Windows binaries built with the pinned Zig 0.17.0 toolchain, "
-            "ReleaseFast optimization, and baseline CPU features. Both native jobs passed Zig unit "
-            "tests and the Python integration suite for this exact tag commit.\n\n"
-            "Each job compared two builds using separate empty local and global caches and checked "
-            "byte-identical archives generated twice. This verifies repeatability within each CI job; "
-            "independent-machine reproducibility has not been established.\n\n"
+            "ReleaseFast optimization, and baseline CPU features. All native unit and integration "
+            "jobs passed for this exact tag commit.\n\n"
+            "Normal builds reuse compiler caches but always install a fresh executable and verify "
+            "its commit, source tree, build inputs, settings, version, and SHA-256. Archives generated "
+            "twice are byte-identical, and their embedded metadata and executable hashes are checked. "
+            "Cold two-build reproducibility is a separate manual workflow and is NOT established "
+            "by this release run; independent-machine reproducibility is not claimed.\n\n"
             "Archives include README.md, LICENSE, LICENSE-ZIG.txt, and BUILD-INFO.json. "
             "Download SHA256SUMS with the archives and verify the SHA-256 checksums before use.\n",
             encoding="utf-8", newline="\n",

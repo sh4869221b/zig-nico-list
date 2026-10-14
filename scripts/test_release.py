@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
+from build_metadata import BUILD_OPTIONS, SCHEMA_VERSION, VERIFICATION
 from draft_release import collect_artifacts, ensure_tag, resolve_tag
 from install_zig import DISTRIBUTIONS, VERSION
 from package_release import TAG_PATTERN, archive_bytes
@@ -67,40 +68,63 @@ class ReleaseGateTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
         self.commit = "a" * 40
+        self.identity = (self.commit, "c" * 40, "d" * 64)
         for target, extension in (("linux-x86_64", ".tar.gz"), ("windows-x86_64", ".zip")):
             folder = self.directory / target
             folder.mkdir()
             name = f"zig-nico-list-v0.01-{target}{extension}"
-            (folder / name).write_bytes(b"test artifact")
-            info = {"tag": "v0.01", "source_commit": self.commit, "target": target,
-                    "archive": name, "zig_version": "0.17.0", "binary_sha256": "b" * 64,
-                    "repeat_binary_sha256": "b" * 64, "sha256": hashlib.sha256(b"test artifact").hexdigest()}
+            binary = "zig-nico-list" + (".exe" if target.startswith("windows") else "")
+            payload = b"test executable"
+            build_info = {"schema_version": SCHEMA_VERSION, "source_commit": self.commit,
+                          "source_tree": self.identity[1], "source_sha256": self.identity[2],
+                          "target": target, "binary": binary, "binary_version": "zig-nico-list version v0.01",
+                          "zig_version": "0.17.0", "build_options": BUILD_OPTIONS,
+                          "verification": VERIFICATION, "binary_sha256": hashlib.sha256(payload).hexdigest()}
+            files = {binary: (payload, 0o755),
+                     "BUILD-INFO.json": (json.dumps(build_info).encode(), 0o644)}
+            files.update({p: (b"documentation", 0o644) for p in ("README.md", "LICENSE", "LICENSE-ZIG.txt")})
+            data = archive_bytes(name.removesuffix(extension), files, target.startswith("windows"))
+            (folder / name).write_bytes(data)
+            info = {**build_info, "tag": "v0.01", "archive": name, "sha256": hashlib.sha256(data).hexdigest()}
             (folder / "artifact-info.json").write_text(json.dumps(info), encoding="utf-8")
 
     def test_requires_both_exact_artifacts(self):
-        artifacts, sums = collect_artifacts(self.directory, "v0.01", self.commit)
+        artifacts, sums = collect_artifacts(self.directory, "v0.01", self.commit, identity=self.identity)
         self.assertEqual(len(artifacts), 2)
         self.assertEqual(len(sums), 2)
         (self.directory / "windows-x86_64" / "unexpected.txt").touch()
         with self.assertRaises(SystemExit):
-            collect_artifacts(self.directory, "v0.01", self.commit)
+            collect_artifacts(self.directory, "v0.01", self.commit, identity=self.identity)
 
     def test_rejects_different_commit(self):
         with self.assertRaises(SystemExit):
-            collect_artifacts(self.directory, "v0.01", "c" * 40)
+            collect_artifacts(self.directory, "v0.01", "c" * 40, identity=self.identity)
 
     def test_rejects_modified_archive(self):
         (self.directory / "linux-x86_64" / "zig-nico-list-v0.01-linux-x86_64.tar.gz").write_bytes(b"changed")
         with self.assertRaises(SystemExit):
-            collect_artifacts(self.directory, "v0.01", self.commit)
+            collect_artifacts(self.directory, "v0.01", self.commit, identity=self.identity)
 
-    def test_rejects_failed_repeat_build(self):
+    def test_rejects_false_repeat_build_claim(self):
         path = self.directory / "windows-x86_64" / "artifact-info.json"
         info = json.loads(path.read_text(encoding="utf-8"))
         info["repeat_binary_sha256"] = "c" * 64
         path.write_text(json.dumps(info), encoding="utf-8")
         with self.assertRaises(SystemExit):
-            collect_artifacts(self.directory, "v0.01", self.commit)
+            collect_artifacts(self.directory, "v0.01", self.commit, identity=self.identity)
+
+
+    def test_rejects_wrong_settings_tree_or_source(self):
+        path = self.directory / "windows-x86_64" / "artifact-info.json"
+        original = json.loads(path.read_text(encoding="utf-8"))
+        for key, value in (("build_options", ["-Doptimize=small"]), ("source_tree", "f" * 40),
+                           ("source_sha256", "f" * 64), ("binary", "other.exe"),
+                           ("verification", "cold-reproducible"), ("binary_sha256", "b" * 64)):
+            with self.subTest(key=key):
+                path.write_text(json.dumps({**original, key: value}), encoding="utf-8")
+                with self.assertRaises(SystemExit):
+                    collect_artifacts(self.directory, "v0.01", self.commit, identity=self.identity)
+        path.write_text(json.dumps(original), encoding="utf-8")
 
 
 class TagGateTests(unittest.TestCase):

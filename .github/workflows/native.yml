@@ -1,4 +1,4 @@
-name: Native tests and repeat builds
+name: Native cached builds and tests
 
 on:
   workflow_call:
@@ -16,8 +16,8 @@ permissions:
   contents: read
 
 jobs:
-  # A separate runner prevents the unit compiler from contending with the two
-  # cold release builds. The caller waits for BOTH jobs (and both OSes).
+  # A separate runner prevents the unit compiler from contending with the
+  # cached executable build. The caller waits for BOTH jobs (and both OSes).
   unit:
     name: ${{ matrix.target }} cached unit tests
     runs-on: ${{ matrix.runner }}
@@ -106,6 +106,8 @@ jobs:
             binary: zig-out/bin/zig-nico-list.exe
     env:
       PYTHONUTF8: '1'
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache/release-fast
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/release-fast
       RELEASE_TAG: ${{ inputs.release_tag }}
       RELEASE_COMMIT: ${{ github.sha }}
     steps:
@@ -114,22 +116,42 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Restore official Zig archive only (no compiler cache)
+      - name: Restore official Zig archive
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: .zig-downloads
           key: zig-archive-v1-${{ runner.os }}-${{ runner.arch }}-0.17.0-${{ hashFiles('scripts/install_zig.py') }}
       - name: Install checksum-pinned Zig 0.17.0
         run: python scripts/install_zig.py
-      - name: Compare two cold native ReleaseFast baseline builds
-        # check_build.py overrides BOTH cache directories separately for each
-        # build. These builds remain cold even when the unit cache hits.
-        run: python scripts/check_build.py
-      - name: Run native CLI integration tests on the verified cold build
+      - name: Identify hosted runner image
+        id: image
+        run: python -c "import os; open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8').write('version=' + os.environ['ImageVersion'] + '\n')"
+      - name: Restore exact-source ReleaseFast compiler cache
+        id: build-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            .zig-cache/release-fast
+            .zig-global-cache/release-fast
+          key: zig-fast-v1-${{ matrix.runner }}-${{ runner.arch }}-${{ steps.image.outputs.version }}-0.17.0-${{ matrix.target }}-baseline-fast-${{ hashFiles('scripts/install_zig.py', 'scripts/build_cached.py', 'scripts/build_metadata.py') }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**/*.zig') }}
+      - name: Build and identify fresh ReleaseFast output using compiler caches
+        run: python scripts/build_cached.py
+      - name: Run native CLI integration tests on this cached build
         env:
           TEST_BINARY: ${{ matrix.binary }}
         shell: bash
         run: python tests/integration.py "$TEST_BINARY"
+      - name: Recheck executable and source identity after integration
+        run: python scripts/build_cached.py --verify-only
+      - name: Record executable compiler cache result
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.build-cache.outputs.cache-hit }}
+        run: echo "ReleaseFast compiler cache exact hit = ${CACHE_HIT:-false}; fresh output and integration checked." >> "$GITHUB_STEP_SUMMARY"
+      - name: Validate normalized packaging without publishing
+        if: ${{ !inputs.package }}
+        run: >-
+          python -c "import json,subprocess; info=json.load(open('zig-out/build-info.json',encoding='utf-8')); subprocess.run(['python','scripts/package_release.py','--tag',info['binary_version'].split()[-1]],check=True)"
       - name: Create and compare normalized release archives
         if: inputs.package
         run: python scripts/package_release.py
@@ -143,3 +165,11 @@ jobs:
           compression-level: 0
           retention-days: 14
           overwrite: true
+      - name: Save successful ReleaseFast compiler cache on main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            .zig-cache/release-fast
+            .zig-global-cache/release-fast
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}

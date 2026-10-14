@@ -33,3 +33,9 @@ Windowsのテスト実行時は末尾を `zig-nico-list.exe` にします。
 CIはWindows/Linuxのネイティブ環境でユニット・ローカルHTTP統合テストを実行します。実サービスへアクセスするテストではありません。ログ文面、時刻表示、進捗表示、HTTPメトリクスの詳細形式はGo版と異なります。Windowsのコンソール割り込みは通常のOS終了動作を使用します。
 
 バージョンは指定どおり `v0.01` です。詳細は英語の[README](../README.md)・[設計](DESIGN.md)をご覧ください。
+
+## CIのキャッシュと再現性検証
+
+通常CIはReleaseSafeユニットテストとReleaseFast実行ファイルビルドの両方にキャッシュを使用し、OSごとに別runnerで並列実行します。キャッシュがあっても毎回新しい出力先へbuildし、commit・ソース・設定・SHA-256を検証し、統合テストを実行します。releaseもこの検証を使用します。
+
+空のlocal/global cacheで2回buildする検査は、手動専用の「Manual cold reproducibility」へ分離しました。通常CI・releaseの成功だけではcold buildの再現性を保証しません。既存v0.01のタグと配布物は変更していません。詳細は[CI検証契約](../scripts/README.md)を参照してください。

@@ -9,9 +9,10 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import tarfile
 import zipfile
+
+from build_metadata import verify_output
 
 ROOT = Path(__file__).resolve().parent.parent
 TAG_PATTERN = r"v[0-9][0-9A-Za-z._+-]*"
@@ -48,22 +49,9 @@ def main():
     if not args.tag or not re.fullmatch(TAG_PATTERN, args.tag):
         raise SystemExit("Expected a version tag such as v0.01")
     info_path = ROOT / "zig-out" / "build-info.json"
-    info = json.loads(info_path.read_text(encoding="utf-8"))
-    if not re.fullmatch(r"[0-9a-f]{40}", info.get("source_commit") or ""):
-        raise SystemExit("A committed source tree is required for a release package")
-    expected_commit = os.environ.get("RELEASE_COMMIT") or os.environ.get("GITHUB_SHA")
-    if expected_commit and info["source_commit"] != expected_commit:
-        raise SystemExit("Build information belongs to a different commit")
-    if info["target"] not in {"linux-x86_64", "windows-x86_64"}:
-        raise SystemExit("Unexpected native target")
-    binary_path = ROOT / "zig-out" / "bin" / info["binary"]
-    binary = binary_path.read_bytes()
-    digest = hashlib.sha256(binary).hexdigest()
-    if digest != info["binary_sha256"] or digest != info["repeat_binary_sha256"]:
-        raise SystemExit("Binary changed after the repeat-build check")
-    version = subprocess.check_output([str(binary_path), "--version"], text=True).strip()
-    if version != f"zig-nico-list version {args.tag}":
-        raise SystemExit(f"Binary version does not match release tag: {version!r}")
+    info, binary = verify_output(ROOT)
+    if info["binary_version"] != f"zig-nico-list version {args.tag}":
+        raise SystemExit(f"Binary version does not match release tag: {info['binary_version']!r}")
     files = {info["binary"]: (binary, 0o755), "BUILD-INFO.json": (info_path.read_bytes(), 0o644)}
     for name in ("LICENSE", "LICENSE-ZIG.txt", "README.md"):
         data = (ROOT / name).read_bytes()
