@@ -36,6 +36,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         page = int(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)['page'][0])
         with self.server.lock:
             self.server.requests.append(page)
+            self.server.connections.append(self.client_address)
             attempt = len(self.server.requests)
         status, payload, headers, stall = self.server.reply(page, attempt, self.path)
         if status == 0:
@@ -44,12 +45,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return
         try:
+            if stall == 'headers':
+                self.server.release.wait(8)
             self.send_response(status)
-            self.send_header('Content-Length', str(len(payload)))
+            if headers.get('Content-Length', True) is not None and 'Transfer-Encoding' not in headers:
+                self.send_header('Content-Length', headers.get('Content-Length', str(len(payload))))
             for key, value in headers.items():
-                self.send_header(key, value)
+                if key != 'Content-Length':
+                    self.send_header(key, value)
             self.end_headers()
             self.wfile.flush()
+            self.server.headers_sent.set()
             if stall:
                 self.server.release.wait(8)
             self.wfile.write(payload)
@@ -64,7 +70,9 @@ def fixture(reply=None):
     server.daemon_threads = True
     server.lock = threading.Lock()
     server.requests = []
+    server.connections = []
     server.release = threading.Event()
+    server.headers_sent = threading.Event()
     server.reply = reply or (lambda p, a, path: (200, body(mylist='/mylists/' in path) if p == 1 else body(()), {}, False))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -305,6 +313,183 @@ class CliIntegration(unittest.TestCase):
                     self.assertEqual(metrics['retries'], 1)
                     self.assertEqual(metrics['attempts'], sum(metrics[key] for key in
                                      ('http_200', 'http_404', 'http_429', 'http_5xx', 'http_other', 'transport_errors')))
+
+    def test_empty_error_response_retains_connection(self):
+        for status in (403, 429, 500):
+            for metrics_enabled in (False, True):
+                with self.subTest(status=status, metrics=metrics_enabled):
+                    def reply(page, attempt, path):
+                        return (status, b'', {}, False) if attempt == 1 else (200, body(('sm1',)), {}, False)
+                    with fixture(reply) as server:
+                        flags = ['--http-metrics'] if metrics_enabled else []
+                        self.check_ok(command(server, '-P2', *flags, USER), 'sm1\n')
+                        self.assertEqual(server.requests, [1, 1])
+                        self.assertEqual(len(set(server.connections)), 1)
+
+    def test_error_connection_close_and_unread_bodies_are_not_reused(self):
+        for payload, headers, stall in ((b'', {'Connection': 'close'}, False),
+                                        (b'not delivered', {}, True),
+                                        (b'', {'Transfer-Encoding': 'chunked'}, True)):
+            with self.subTest(headers=headers, stall=stall):
+                def reply(page, attempt, path):
+                    return (403, payload, headers, stall) if attempt == 1 else (200, body(('sm1',)), {}, False)
+                with fixture(reply) as server:
+                    self.check_ok(command(server, '-P2', '--http-metrics', USER), 'sm1\n')
+                    self.assertEqual(len(set(server.connections)), 2)
+
+    def test_complete_chunked_body_and_trailers_remain_valid(self):
+        payload = body(('sm1',))
+        middle = len(payload) // 2
+        wire = (f'{middle:x};fixture=yes\r\n'.encode() + payload[:middle] + b'\r\n' +
+                f'{len(payload) - middle:x}\r\n'.encode() + payload[middle:] +
+                b'\r\n0\r\nX-Fixture: complete\r\n\r\n')
+        with fixture(lambda *_: (200, wire, {'Transfer-Encoding': 'chunked'}, False)) as server:
+            self.check_ok(command(server, '-P2', '--http-metrics', USER), 'sm1\n')
+
+    def test_empty_404_can_reuse_connection_for_next_target(self):
+        def reply(page, attempt, path):
+            return (404, b'', {}, False) if '/users/1/' in path else (200, body(('sm2',)), {}, False)
+        with fixture(reply) as server:
+            self.check_ok(command(server, '-T1', '-P2', '--http-metrics', USER,
+                                  'https://www.nicovideo.jp/user/2'), 'sm2\n')
+            self.assertEqual(len(set(server.connections)), 1)
+
+    def test_unknown_length_error_body_does_not_block_or_reuse(self):
+        def reply(page, attempt, path):
+            return (403, b'not delivered', {'Content-Length': None}, True) if attempt == 1 else (200, body(('sm1',)), {}, False)
+        with fixture(reply) as server:
+            self.check_ok(command(server, '-P2', '--timeout', '250ms', '--http-metrics', USER), 'sm1\n')
+            self.assertEqual(len(set(server.connections)), 2)
+
+    def test_attempt_trace_timeout_phase_and_received_status(self):
+        for phase in ('head', 'body'):
+            with self.subTest(phase=phase), fixture(lambda *_: (200, body(), {}, 'headers' if phase == 'head' else True)) as server:
+                result = command(server, '-A', '--http-metrics', '--timeout', '100ms', USER)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                rows = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+                trace, = [row['attempt'] for row in rows if row.get('msg') == 'http_attempt']
+                metrics = next(row['http']['metrics'] for row in rows if row.get('msg') == 'http_metrics')
+                self.assertEqual(trace['phase'], phase)
+                self.assertEqual(trace['error_name'], 'Timeout')
+                self.assertEqual(trace['status'], 200 if phase == 'body' else 0)
+                self.assertGreater(trace[phase + '_ns'], 0)
+                self.assertEqual(metrics['timeouts'], 1)
+                self.assertEqual(metrics['cancellations'], 0)
+                self.assertEqual(metrics['body_errors'], int(phase == 'body'))
+                self.assertEqual(metrics['response_200_heads'], int(phase == 'body'))
+                self.assertEqual(metrics['transport_errors'], 1)
+                self.assertEqual(metrics['retries'], 0)
+
+    def test_attempt_trace_correlates_retries_without_private_urls(self):
+        statuses = [403, 401, 500, 429, 0, 200]
+        def reply(page, attempt, path):
+            status = statuses[attempt - 1]
+            return status, body(('sm1',)) if status == 200 else b'', {}, False
+        with fixture(reply) as server:
+            result = command(server, '-A', '-P2', '--retries', '6', '--http-metrics',
+                             'https://www.nicovideo.jp/user/987654321?private=secret')
+            self.check_ok(result, 'sm1\n')
+            rows = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+            traces = [row['attempt'] for row in rows if row.get('msg') == 'http_attempt']
+            metrics = next(row['http']['metrics'] for row in rows if row.get('msg') == 'http_metrics')
+            self.assertEqual([t['request_id'] for t in traces], [1, 2, 3, 4, 5, 6])
+            self.assertEqual([t['attempt'] for t in traces], [1, 2, 3, 4, 5, 6])
+            self.assertEqual([t['retry_cause'] for t in traces], ['none', 'http_403', 'http_other', 'http_5xx', 'http_429', 'transport'])
+            self.assertEqual({(t['target_sequence'], t['page']) for t in traces}, {(0, 1)})
+            self.assertEqual(traces[-1]['response_version'], 'HTTP/1.1')
+            self.assertEqual(traces[3]['throttle_decision']['reason'], 'http_429')
+            for cause in ('http_403', 'http_other', 'http_5xx', 'http_429', 'transport'):
+                self.assertEqual(metrics['retry_' + cause], 1)
+            self.assertEqual(metrics['retries'], 5)
+            self.assertEqual(metrics['http_403'], 1)
+            self.assertGreater(metrics['pool_hits'], 0)
+            self.assertEqual(sum(metrics[k] for k in ('pool_hits', 'pool_misses', 'pool_lookup_unknown')), 6)
+            for trace in traces:
+                self.assertGreaterEqual(trace['duration_ns'], sum(trace[k] for k in
+                    ('acquire_ns', 'send_ns', 'head_ns', 'body_ns', 'cleanup_ns')))
+            self.assertNotIn('987654321', result.stderr)
+            self.assertNotIn('secret', result.stderr)
+            self.assertNotIn('registeredAt', result.stderr)
+
+    def test_attempt_trace_is_opt_in(self):
+        with fixture() as server:
+            result = command(server, USER)
+            self.check_ok(result, 'sm2\nsm10\n')
+            self.assertNotIn('http_attempt', result.stderr)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX graceful SIGINT test')
+    def test_sigint_body_is_neutral_and_not_timeout(self):
+        with fixture(lambda *_: (200, body(), {}, True)) as server:
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            proc = subprocess.Popen([BINARY, '--no-progress', '-A', '--json', '--http-metrics',
+                                     '--timeout', '5s', USER], env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertTrue(server.headers_sent.wait(5))
+                proc.send_signal(signal.SIGINT)
+                stdout, stderr = proc.communicate(timeout=3)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate(timeout=3)
+            self.assertEqual(proc.returncode, 0, stderr)
+            self.assertEqual(json.loads(stdout)['items'], [])
+            self.assertEqual(json.loads(stdout)['targets'][0]['error'], '')
+            rows = [json.loads(line) for line in stderr.splitlines() if line.startswith('{')]
+            trace, = [row['attempt'] for row in rows if row.get('msg') == 'http_attempt']
+            http = next(row['http'] for row in rows if row.get('msg') == 'http_metrics')
+            self.assertEqual(trace['error_name'], 'Canceled')
+            self.assertEqual(http['metrics']['cancellations'], 1)
+            self.assertEqual(http['metrics']['timeouts'], 0)
+            self.assertEqual(http['adaptive']['overload_errors'], 0)
+            self.assertEqual(server.requests, [1])
+
+    def test_truncated_body_records_body_failure_without_retry(self):
+        valid_json = body(('sm1',))
+        # Include complete JSON with missing HTTP framing: parsing the prefix
+        # would otherwise falsely report success. Also cover malformed JSON.
+        for wire, headers in ((b'{', {'Content-Length': '100'}),
+                              (valid_json, {'Content-Length': str(len(valid_json) + 10)}),
+                              (f'{len(valid_json):x}\r\n'.encode() + valid_json,
+                               {'Transfer-Encoding': 'chunked'})):
+            headers = dict(headers, Connection='close')
+            with self.subTest(headers=headers), fixture(lambda *_: (200, wire, headers, False)) as server:
+                result = command(server, '-P2', '--http-metrics', USER)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, '')
+                rows = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+                trace, = [row['attempt'] for row in rows if row.get('msg') == 'http_attempt']
+                metrics = next(row['http']['metrics'] for row in rows if row.get('msg') == 'http_metrics')
+                self.assertEqual(trace['phase'], 'body')
+                self.assertIn('error_name', trace)
+                self.assertEqual(metrics['body_errors'], 1)
+                self.assertEqual(metrics['decode_errors'], 0)
+                self.assertEqual(metrics['response_200_heads'], 1)
+                self.assertEqual(metrics['timeouts'], 0)
+                self.assertEqual(metrics['retries'], 0)
+
+    def test_later_truncated_body_retains_successful_prefix(self):
+        for flags in ([], ['--no-sort'], ['--json', '--best-effort']):
+            with self.subTest(flags=flags):
+                def reply(page, attempt, path):
+                    payload = body((f'sm{page}',), total=200)
+                    headers = {} if page == 1 else {'Content-Length': str(len(payload) + 10), 'Connection': 'close'}
+                    return 200, payload, headers, False
+                with fixture(reply) as server:
+                    result = command(server, '-P2', *flags, USER)
+                    self.assertEqual(result.returncode, int('--best-effort' not in flags), result.stderr)
+                    if '--json' in flags:
+                        output = json.loads(result.stdout)
+                        self.assertEqual(output['items'], ['sm1'])
+                        self.assertEqual(output['targets'][0]['error'], 'TruncatedResponseBody')
+                    else:
+                        self.assertEqual(result.stdout, 'sm1\n')
+                    self.assertIn('fetch_ok=0 fetch_err=1 output_count=1', result.stderr)
+                    self.assertEqual(server.requests, [1, 2])
+
+    def test_close_delimited_body_remains_valid(self):
+        with fixture(lambda *_: (200, body(('sm1',)), {'Content-Length': None, 'Connection': 'close'}, False)) as server:
+            self.check_ok(command(server, '-P2', USER), 'sm1\n')
 
     def test_logfile_keeps_stdout_clean(self):
         with fixture() as server, tempfile.TemporaryDirectory() as tmp:

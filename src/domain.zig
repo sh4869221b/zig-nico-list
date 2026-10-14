@@ -35,6 +35,25 @@ pub const Metrics = struct {
     http_429: u64 = 0,
     http_5xx: u64 = 0,
     http_other: u64 = 0,
+    http_403: u64 = 0,
+    response_heads: u64 = 0,
+    response_200_heads: u64 = 0,
+    timeouts: u64 = 0,
+    cancellations: u64 = 0,
+    body_errors: u64 = 0,
+    pool_hits: u64 = 0,
+    pool_misses: u64 = 0,
+    pool_lookup_unknown: u64 = 0,
+    retry_http_403: u64 = 0,
+    retry_http_other: u64 = 0,
+    retry_http_429: u64 = 0,
+    retry_http_5xx: u64 = 0,
+    retry_transport: u64 = 0,
+    acquire_ns: u64 = 0,
+    send_ns: u64 = 0,
+    head_ns: u64 = 0,
+    body_ns: u64 = 0,
+    cleanup_ns: u64 = 0,
     transport_errors: u64 = 0,
     decode_errors: u64 = 0,
     body_bytes: u64 = 0,
@@ -250,6 +269,8 @@ pub const Context = struct {
     client: *std.http.Client,
     /// One deadline per active HTTP attempt; the scheduler owns cancellation.
     deadline: ?*Deadline = null,
+    target_sequence: usize = 0,
+    trace_fn: ?*const fn (?*anyopaque, AttemptTrace) void = null,
     log_context: ?*anyopaque = null,
     log_fn: ?*const fn (?*anyopaque, []const u8, []const u8, []const u8) void = null,
     fn log(self: *Context, level: []const u8, message: []const u8, detail: []const u8) void {
@@ -258,18 +279,87 @@ pub const Context = struct {
 };
 
 const Response = struct { status: u16, body: []u8, retry_after: i64 = 0, body_error: ?anyerror = null };
-const Attempt = struct { generation: u64, index: i64, retry_at: i64 = 0 };
+/// Invocation-local numeric correlation only: no URLs, headers, or payloads.
+/// acquire includes pool lookup, certificates, DNS, TCP and TLS; head includes
+/// redirects. Timings include failed/expired phases and are not first-byte traces.
+pub const AttemptTrace = struct {
+    request_id: u64 = 0,
+    target_sequence: usize = 0,
+    page: usize = 0,
+    attempt: i64 = 0,
+    elapsed_ns: i64 = 0,
+    duration_ns: i64 = 0,
+    acquire_ns: i64 = 0,
+    send_ns: i64 = 0,
+    head_ns: i64 = 0,
+    body_ns: i64 = 0,
+    cleanup_ns: i64 = 0,
+    phase: enum { acquire, send, head, body, complete } = .acquire,
+    connection: enum { unknown, pool_miss, pool_hit } = .unknown,
+    response_version: ?[]const u8 = null,
+    status: u16 = 0,
+    transport_error: ?[]const u8 = null,
+    error_name: ?[]const u8 = null,
+    retry_cause: enum { none, http_403, http_other, http_429, http_5xx, transport } = .none,
+    limit: usize = 0,
+    generation: u64 = 0,
+    throttle_decision: ?adaptive.Decision = null,
+    adaptive_prior_decision: ?adaptive.Decision = null,
+    adaptive_decision: ?adaptive.Decision = null,
+};
+const Attempt = struct { generation: u64, index: i64, retry_at: i64 = 0, trace: AttemptTrace = .{} };
 fn requestRaw(ctx: *Context, url: []const u8, attempt_info: *Attempt) anyerror!Response {
-    var req = try ctx.client.request(.GET, try std.Uri.parse(url), .{
+    const trace = &attempt_info.trace;
+    var phase_started = now(ctx.io);
+    defer switch (trace.phase) {
+        .acquire => trace.acquire_ns = now(ctx.io) - phase_started - trace.cleanup_ns,
+        .send => trace.send_ns = now(ctx.io) - phase_started - trace.cleanup_ns,
+        .head => trace.head_ns = now(ctx.io) - phase_started - trace.cleanup_ns,
+        .body => trace.body_ns = now(ctx.io) - phase_started - trace.cleanup_ns,
+        .complete => {},
+    };
+    const uri = try std.Uri.parse(url);
+    // Use the same public pool operation as Client.connect for direct requests.
+    // Proxies and redirected connections cannot be classified by this lookup.
+    var pooled: ?*std.http.Client.Connection = null;
+    if (ctx.cfg.http_metrics and ctx.client.http_proxy == null and ctx.client.https_proxy == null) {
+        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
+        var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host = try std.Io.net.HostName.fromUri(uri, &host_buffer);
+        pooled = try ctx.client.connection_pool.findConnection(ctx.io, .{
+            .host = host,
+            .port = uri.port orelse @as(u16, if (protocol == .tls) 443 else 80),
+            .protocol = protocol,
+        });
+        trace.connection = if (pooled != null) .pool_hit else .pool_miss;
+    }
+    var req = ctx.client.request(.GET, uri, .{
+        .connection = pooled,
         .headers = .{ .accept_encoding = .omit },
         .extra_headers = &.{ .{ .name = "X-Frontend-Id", .value = "6" }, .{ .name = "Accept", .value = "*/*" } },
         .redirect_behavior = .init(10),
-    });
-    defer req.deinit();
+    }) catch |err| {
+        if (pooled) |connection| ctx.client.connection_pool.release(connection, ctx.io);
+        return err;
+    };
+    defer {
+        const cleanup_started = now(ctx.io);
+        req.deinit();
+        trace.cleanup_ns = now(ctx.io) - cleanup_started;
+    }
+    trace.acquire_ns = now(ctx.io) - phase_started;
+    trace.phase = .send;
+    phase_started = now(ctx.io);
     try req.sendBodiless();
+    trace.send_ns = now(ctx.io) - phase_started;
+    trace.phase = .head;
+    phase_started = now(ctx.io);
     var redirect_buffer: [8192]u8 = undefined;
     var res = try req.receiveHead(&redirect_buffer);
-    const status = @backingInt(res.head.status);
+    trace.head_ns = now(ctx.io) - phase_started;
+    trace.status = @backingInt(res.head.status);
+    trace.response_version = @tagName(res.head.version);
+    const status = trace.status;
     var retry_after: i64 = 0;
     if (status == 429) {
         var headers = res.head.iterateHeaders();
@@ -286,17 +376,35 @@ fn requestRaw(ctx: *Context, url: []const u8, attempt_info: *Attempt) anyerror!R
         c.mutex.lockUncancelable(ctx.io);
         const before = c.controller.cooldown_until_ns;
         c.controller.throttle(received, delay, attempt_info.generation);
+        trace.throttle_decision = c.controller.recentDecision(0);
         if (c.controller.cooldown_until_ns > before) c.pause_epoch +%= 1;
         c.changed.broadcast(ctx.io);
         c.mutex.unlock(ctx.io);
     }
     if (status != 200) {
-        // Closing an unread error/404 body must never block on draining it.
-        if (req.connection) |connection| connection.closing = true;
+        // Deinit otherwise drains received_head, potentially blocking. A
+        // framed zero-length body needs no I/O and can safely retain keep-alive.
+        if (res.head.content_length != 0 or res.head.transfer_encoding != .none) {
+            if (req.connection) |connection| connection.closing = true;
+        }
+        trace.phase = .complete;
         return .{ .status = status, .body = try ctx.temporary.alloc(u8, 0), .retry_after = retry_after };
     }
+    trace.phase = .body;
+    phase_started = now(ctx.io);
     var transfer: [16384]u8 = undefined;
     const body = res.reader(&transfer).allocRemaining(ctx.temporary, .unlimited) catch |err| return .{ .status = status, .body = try ctx.temporary.alloc(u8, 0), .body_error = err };
+    // allocRemaining accepts EOF, including a premature EOF from Zig's HTTP
+    // body reader. Do not accept a valid JSON prefix until HTTP framing ends.
+    switch (req.reader.state) {
+        .body_remaining_content_length, .body_remaining_chunk_len => {
+            ctx.temporary.free(body);
+            return .{ .status = status, .body = try ctx.temporary.alloc(u8, 0), .body_error = error.TruncatedResponseBody };
+        },
+        else => {}, // EOF is the delimiter for body_none.
+    }
+    trace.body_ns = now(ctx.io) - phase_started;
+    trace.phase = .complete;
     return .{ .status = status, .body = body, .retry_after = retry_after };
 }
 fn requestTimed(ctx: *Context, url: []const u8, attempt_info: *Attempt) !Response {
@@ -309,6 +417,9 @@ fn requestTimed(ctx: *Context, url: []const u8, attempt_info: *Attempt) !Respons
     // be mistaken for a retryable transport failure (or a body/decode error).
     // Clearing and claiming an expired attempt use the same atomic word:
     // an old supervisor observation cannot cancel the next retry attempt.
+    if (response) |value| {
+        if (value.body_error) |err| attempt_info.trace.transport_error = @errorName(err);
+    } else |err| attempt_info.trace.transport_error = @errorName(err);
     const outcome = deadline.complete(expires, now(ctx.io));
     if (outcome != .completed) {
         if (response) |value| {
@@ -389,6 +500,7 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
     var status_error: u16 = 0;
     var attempt: i64 = 0;
     var accumulated_rate: i64 = 0;
+    var retry_cause: @FieldType(AttemptTrace, "retry_cause") = .none;
     while (attempt < ctx.cfg.retries) : (attempt += 1) {
         try check(ctx.io);
         try c.waitReady(retry_at);
@@ -420,14 +532,52 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
         c.metrics.attempts += 1;
         if (attempt > 0) c.metrics.retries += 1;
         c.metrics.rate_wait_ns +|= @intCast(@max(0, accumulated_rate));
-        c.mutex.unlock(ctx.io);
         const started = now(ctx.io);
-        var attempt_info: Attempt = .{ .generation = generation, .index = attempt };
+        var attempt_info: Attempt = .{ .generation = generation, .index = attempt, .trace = .{
+            .request_id = c.metrics.attempts,
+            .target_sequence = ctx.target_sequence,
+            .page = number,
+            .attempt = attempt + 1,
+            .elapsed_ns = started - c.started,
+            .retry_cause = retry_cause,
+            .limit = c.httpLimit(),
+            .generation = generation,
+        } };
+        switch (retry_cause) {
+            .none => {},
+            .http_403 => c.metrics.retry_http_403 += 1,
+            .http_other => c.metrics.retry_http_other += 1,
+            .http_429 => c.metrics.retry_http_429 += 1,
+            .http_5xx => c.metrics.retry_http_5xx += 1,
+            .transport => c.metrics.retry_transport += 1,
+        }
+        c.mutex.unlock(ctx.io);
         const result = requestTimed(ctx, url, &attempt_info);
         const ended = now(ctx.io);
         c.mutex.lockUncancelable(ctx.io);
         c.in_flight -= 1;
         c.metrics.service_ns +|= @intCast(@max(0, ended - started));
+        const trace = &attempt_info.trace;
+        trace.duration_ns = ended - started;
+        if (result) |value| {
+            if (value.body_error) |err| trace.error_name = @errorName(err);
+        } else |err| {
+            trace.error_name = @errorName(err);
+            if (err == error.Timeout) c.metrics.timeouts += 1;
+            if (err == error.Canceled) c.metrics.cancellations += 1;
+        }
+        inline for (.{ "acquire_ns", "send_ns", "head_ns", "body_ns", "cleanup_ns" }) |field| {
+            @field(c.metrics, field) +|= @intCast(@max(0, @field(trace, field)));
+        }
+        switch (trace.connection) {
+            .pool_miss => c.metrics.pool_misses += 1,
+            .pool_hit => c.metrics.pool_hits += 1,
+            .unknown => c.metrics.pool_lookup_unknown += 1,
+        }
+        if (trace.status != 0) c.metrics.response_heads += 1;
+        if (trace.status == 200) c.metrics.response_200_heads += 1;
+        if (trace.status == 403) c.metrics.http_403 += 1;
+        if (trace.phase == .body and trace.error_name != null) c.metrics.body_errors += 1;
         const status: u16 = if (result) |r| r.status else |_| 0;
         const transport_error: bool = if (result) |_| false else |_| true;
         switch (status) {
@@ -443,11 +593,23 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
         const caller_canceled = canceled.load(.acquire) or if (result) |r| (if (r.body_error) |e| e == error.Canceled else false) else |e| e == error.Canceled;
         const body_error = if (result) |r| r.body_error != null else |_| false;
         if (ctx.cfg.concurrency_adaptive) {
+            const decisions_before = c.controller.decisions_total;
             c.controller.observe(ended, .{ .generation = generation, .service_ns = ended - started, .rate_wait_ns = accumulated_rate, .success = !caller_canceled and status == 200 and !body_error, .overload = !caller_canceled and (transport_error or body_error or status >= 500 and status < 600) }, .{ .pending = @intCast(c.pending + c.worker_pending), .in_flight = @intCast(c.in_flight) });
+            const added = c.controller.decisions_total - decisions_before;
+            // observe can expire a window and evaluate a new window (at most two).
+            if (added > 0) trace.adaptive_decision = c.controller.recentDecision(0);
+            if (added > 1) trace.adaptive_prior_decision = c.controller.recentDecision(1);
         }
         c.mutex.unlock(ctx.io);
         c.release();
         accumulated_rate = 0;
+        if (ctx.cfg.http_metrics) if (ctx.trace_fn) |f| f(ctx.log_context, attempt_info.trace);
+        retry_cause = if (transport_error) .transport else switch (status) {
+            403 => .http_403,
+            429 => .http_429,
+            500...599 => .http_5xx,
+            else => .http_other,
+        };
         var retry_after: i64 = 0;
         if (result) |response| {
             defer ctx.temporary.free(response.body);
