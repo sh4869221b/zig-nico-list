@@ -101,7 +101,7 @@ def run(binary, mode):
                     'stderr': str(error.stderr), 'requests': server.requests}
         output = json.loads(result.stdout)
         expected_ids = [] if mode == 'short_deadline' or mode.startswith('adaptive_timeout_') else ['sm1']
-        expects_error = mode == 'earlier_error'
+        expects_error = mode == 'earlier_error' or mode == 'short_deadline' or mode.startswith('adaptive_timeout_')
         target = output['targets'][0]
         passed = (result.returncode == int(expects_error)
                   and output['items'] == expected_ids
@@ -113,6 +113,8 @@ def run(binary, mode):
             logs = [json.loads(line) for line in result.stderr.decode().splitlines() if line.startswith('{')]
             metrics = next(item['http'] for item in logs if item.get('msg') == 'http_metrics')
             passed &= metrics['adaptive']['overload_errors'] == 1
+            passed &= any(item.get('msg') == 'failed to get video list' and item.get('error') == 'Timeout' for item in logs)
+            passed &= 'fetch_ok=0 fetch_err=1' in result.stderr.decode()
             passed &= server.requests == [1]
         return {'pass': passed, 'exit': result.returncode, 'output': output,
                 'stderr': result.stderr.decode(), 'requests': server.requests}

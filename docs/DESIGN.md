@@ -61,8 +61,13 @@ its own timestamp as well, so a short timeout cannot be missed between polls.
 Io.Future.cancel cancellation is consumed at the next cancellation point, and
 std.http may wrap it in ReadFailed. The owning Deadline therefore preserves the
 reason independently of the transport error. Client timeout stays Timeout for
-adaptive overload feedback and is mapped to a successful empty canceled target
-only after observation. Caller cancellation stays neutral. Error/404 response
+adaptive overload feedback and is propagated as a terminal page failure. It is
+not retried inside the canceled page future: the supervisor is joining that
+future and cannot supervise a new attempt there. Other transport errors retain
+the configured attempt/backoff budget. Caller cancellation stays neutral.
+A failed target retains its successfully committed page prefix, carries an
+error in JSON and diagnostics, and increments fetch_err. The default exit is
+nonzero; explicit --best-effort keeps its existing exit-code override. Error/404 response
 bodies are closed without a blocking drain, as in the first port.
 
 ## Memory ownership
