@@ -152,7 +152,13 @@ The already-published v0.01 tag and assets are unchanged by this CI change.
 ## Validation and timing
 
 Run `python -m unittest discover -s scripts -p 'test_*.py' -v` for offline cache,
-stale-output, metadata, archive, and release-gate regression checks. Run Zig
+stale-output, metadata, archive, release-gate, and CI-routing regression checks.
+Routing cases include positive/negative events, documentation-only and mixed
+changes, PR merge-base behavior, renames/deletions, a 3,051-file diff, unknown
+inputs, and failed/cancelled/unexpectedly skipped aggregate dependencies.
+`python scripts/check_docs.py` checks tracked Markdown and required package
+documents offline; it does not claim external-link or rendered-page validation.
+Run Zig
 formatting, ReleaseSafe unit tests, and the offline CLI integration suite too.
 Use Actions job/step durations plus exact cache-hit logs to distinguish first
 cache-populating builds from warm builds. Restoring a compiler cache does not
