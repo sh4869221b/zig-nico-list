@@ -91,7 +91,7 @@ class CliIntegration(unittest.TestCase):
 
     def test_version_help(self):
         version = subprocess.run([BINARY, '--version'], capture_output=True, text=True, check=True)
-        self.assertEqual(version.stdout, 'zig-nico-list version v0.01\n')
+        self.assertEqual(version.stdout, 'zig-nico-list version v0.02\n')
         help_result = subprocess.run([BINARY, '--help'], capture_output=True, text=True, check=True)
         self.assertIn('--concurrency-targets', help_result.stdout)
         self.assertEqual(help_result.stderr, '')

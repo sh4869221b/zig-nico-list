@@ -4,7 +4,7 @@ const cli = @import("cli.zig");
 const domain = @import("domain.zig");
 const scheduler = @import("scheduler.zig");
 const Io = std.Io;
-const version = "v0.01";
+const version = "v0.02";
 
 fn interrupt(_: std.posix.SIG) callconv(.c) void {
     domain.canceled.store(true, .release);
