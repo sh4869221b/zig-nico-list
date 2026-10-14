@@ -118,3 +118,62 @@ echo exit=$run_status
 Keep the summary, wall time, exit code, commit and hash alongside that logfile.
 Review long attempt phases and retry correlations before making another request
 batch. Do not repeatedly probe denied URLs or alter identity to bypass a 403.
+
+## PowerShell measurement (Windows)
+
+Use native Windows Zig 0.17.0 in a checkout of `fix/http-stall-diagnostics`.
+The Linux fixture tests do not establish Windows runtime behavior; run the
+Windows unit/integration commands below before measuring the live workload.
+Neither these builds nor the source bundle publish a release. The executable
+still reports v0.02, so retain the commit and SHA-256 as its identity.
+
+```powershell
+zig version # must print 0.17.0
+zig build test -Doptimize=safe
+if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed' }
+zig build -Doptimize=fast -Dcpu=baseline
+if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+python tests/integration.py .\zig-out\bin\zig-nico-list.exe
+if ($LASTEXITCODE -ne 0) { throw 'Integration tests failed' }
+
+$exe = (Resolve-Path .\zig-out\bin\zig-nico-list.exe).Path
+$commit = (git rev-parse HEAD).Trim()
+$binaryHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+$version = (& $exe -v | Out-String).Trim()
+$inputFiles = @(memo l --fullpath nico_user)
+if ($LASTEXITCODE -ne 0 -or $inputFiles.Count -ne 1) {
+    throw 'memo must return exactly one input-file path'
+}
+$inputFile = ([string]$inputFiles[0]).Trim()
+if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
+    throw 'Input file does not exist'
+}
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+$logFile = "http-stall-$stamp.jsonl"
+$stderrFile = "http-stall-$stamp.stderr.txt"
+$metadataFile = "http-stall-$stamp.metadata.json"
+$startedUtc = [DateTime]::UtcNow.ToString('o')
+$watch = [System.Diagnostics.Stopwatch]::StartNew()
+& $exe --input-file $inputFile --url --datebefore 20180401 --comment=-1 --no-progress --no-sort -A --http-metrics --logfile $logFile > $null 2> $stderrFile
+$runExitCode = $LASTEXITCODE # capture immediately, before any other native command
+$watch.Stop()
+[ordered]@{
+    commit = $commit
+    binary_sha256 = $binaryHash
+    binary_version = $version
+    started_utc = $startedUtc
+    wall_seconds = $watch.Elapsed.TotalSeconds
+    exit_code = $runExitCode
+    logfile = $logFile
+    stderr_file = $stderrFile
+} | ConvertTo-Json | Set-Content -LiteralPath $metadataFile -Encoding UTF8
+Get-Content -LiteralPath $metadataFile
+Get-Content -LiteralPath $stderrFile
+```
+
+The measured interval covers the binary invocation and PowerShell redirection;
+input-path lookup, builds and fixture tests happen beforehand. Use the same
+PowerShell version and instrumentation when comparing runs. Retain the three
+new files together. Metrics are in the JSONL file, while the summary and final
+error are in the stderr file. Windows Ctrl+C uses normal process termination;
+the POSIX neutral SIGINT test is intentionally skipped on Windows.

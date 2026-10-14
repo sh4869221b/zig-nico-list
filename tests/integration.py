@@ -337,6 +337,30 @@ class CliIntegration(unittest.TestCase):
                     self.check_ok(command(server, '-P2', '--http-metrics', USER), 'sm1\n')
                     self.assertEqual(len(set(server.connections)), 2)
 
+    def test_complete_chunked_body_and_trailers_remain_valid(self):
+        payload = body(('sm1',))
+        middle = len(payload) // 2
+        wire = (f'{middle:x};fixture=yes\r\n'.encode() + payload[:middle] + b'\r\n' +
+                f'{len(payload) - middle:x}\r\n'.encode() + payload[middle:] +
+                b'\r\n0\r\nX-Fixture: complete\r\n\r\n')
+        with fixture(lambda *_: (200, wire, {'Transfer-Encoding': 'chunked'}, False)) as server:
+            self.check_ok(command(server, '-P2', '--http-metrics', USER), 'sm1\n')
+
+    def test_empty_404_can_reuse_connection_for_next_target(self):
+        def reply(page, attempt, path):
+            return (404, b'', {}, False) if '/users/1/' in path else (200, body(('sm2',)), {}, False)
+        with fixture(reply) as server:
+            self.check_ok(command(server, '-T1', '-P2', '--http-metrics', USER,
+                                  'https://www.nicovideo.jp/user/2'), 'sm2\n')
+            self.assertEqual(len(set(server.connections)), 1)
+
+    def test_unknown_length_error_body_does_not_block_or_reuse(self):
+        def reply(page, attempt, path):
+            return (403, b'not delivered', {'Content-Length': None}, True) if attempt == 1 else (200, body(('sm1',)), {}, False)
+        with fixture(reply) as server:
+            self.check_ok(command(server, '-P2', '--timeout', '250ms', '--http-metrics', USER), 'sm1\n')
+            self.assertEqual(len(set(server.connections)), 2)
+
     def test_attempt_trace_timeout_phase_and_received_status(self):
         for phase in ('head', 'body'):
             with self.subTest(phase=phase), fixture(lambda *_: (200, body(), {}, 'headers' if phase == 'head' else True)) as server:
