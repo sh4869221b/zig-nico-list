@@ -5,7 +5,7 @@ const cli = @import("cli.zig");
 const domain = @import("domain.zig");
 const scheduler = @import("scheduler.zig");
 const Io = std.Io;
-const version = "v0.03";
+const version = "v0.04";
 var interrupted: std.atomic.Value(bool) = .init(false);
 
 fn interrupt(_: std.posix.SIG) callconv(.c) void {
