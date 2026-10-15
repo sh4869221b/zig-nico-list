@@ -213,6 +213,12 @@ socket to the pool, and every application retry selected it again without a new
 GET reaching the server. Four attempts reproduced failure after 0.73 seconds;
 the default ten-attempt schedule can add 51.1 seconds of backoff to such a page.
 
+TCP stacks may report this idle reset during the write or during the following
+response-head read. The integration fixture accepts either corresponding error,
+while requiring one application retry, no transparent replay, and recovery on a
+different connection. A deterministic writer-failure unit test checks the
+send-specific cleanup path independently of OS reset timing.
+
 `sendBodiless` now marks its connection closing on any failed send, including
 sends following redirects. The normal application retry/backoff rules still
 apply to write failures, but the next attempt can open a functioning connection.

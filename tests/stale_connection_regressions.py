@@ -86,7 +86,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             self.wfile.flush()
-            if mode == 'send_reset' and n == 1:
+            if mode == 'idle_reset' and n == 1:
                 # Deliver RST while the client's pacing wait leaves this
                 # previously successful socket idle in its pool.
                 linger_format = 'HH' if os.name == 'nt' else 'ii'
@@ -119,9 +119,9 @@ def run(binary, mode, metrics=True):
     with fixture(mode) as server:
         env = {k: v for k, v in os.environ.items() if 'proxy' not in k.lower()}
         env['NICO_BASE_URL'] = f'http://127.0.0.1:{server.server_port}/v3'
-        args = [str(binary), '--no-progress', '-A', '-T1', '-P1', '-H1', '--retries', '4' if mode == 'send_reset' else '1',
+        args = [str(binary), '--no-progress', '-A', '-T1', '-P1', '-H1', '--retries', '4' if mode == 'idle_reset' else '1',
                 '--timeout', '400ms' if mode == 'replay_timeout' else '160ms', '--json', TARGET]
-        if mode == 'send_reset':
+        if mode == 'idle_reset':
             args.extend(['--min-interval', '100ms'])
         if metrics:
             args.append('--http-metrics')
@@ -200,8 +200,8 @@ class StaleConnectionTests(unittest.TestCase):
             self.assertEqual(http['adaptive']['decreases'], 0)
             self.assertGreaterEqual(http['adaptive']['current'], 8)
 
-    def test_failed_send_discards_poisoned_connection_before_retry(self):
-        result = run(self.binary, 'send_reset')
+    def test_idle_reset_discards_connection_before_application_retry(self):
+        result = run(self.binary, 'idle_reset')
         self.assertEqual(result['exit'], 0, result)
         self.assertEqual(result['output']['items'], ['sm1'])
         self.assertEqual(len(result['requests']), 2, result)
@@ -212,8 +212,10 @@ class StaleConnectionTests(unittest.TestCase):
         self.assertEqual(http['metrics']['transport_errors'], 1)
         self.assertEqual(http['metrics']['transport_replays'], 0)
         failed, = [row['attempt'] for row in result['logs'] if row.get('attempt', {}).get('error_name')]
-        self.assertEqual(failed['phase'], 'send')
-        self.assertEqual(failed['error_name'], 'WriteFailed')
+        # TCP stacks can report the idle RST on write or on the following read.
+        # Both must discard this socket and use the normal application retry.
+        self.assertIn((failed['phase'], failed['error_name']),
+                      (('send', 'WriteFailed'), ('head', 'ReadFailed')), result)
 
 
 def suite(binary):

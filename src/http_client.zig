@@ -1983,3 +1983,64 @@ pub fn fetch(client: *Client, options: FetchOptions) FetchError!FetchResult {
 test {
     _ = Response;
 }
+
+test "failed bodiless sends discard pooled connections while reader is ready" {
+    const ResetIo = struct {
+        writes: usize = 0,
+        closes: usize = 0,
+
+        fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            return switch (operation) {
+                .net_write => blk: {
+                    self.writes += 1;
+                    break :blk .{ .net_write = error.ConnectionResetByPeer };
+                },
+                else => unreachable,
+            };
+        }
+
+        fn close(userdata: ?*anyopaque, sockets: []const Io.net.Socket) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.closes += sockets.len;
+        }
+    };
+
+    // Cover failures while writing the head and while flushing its buffer.
+    // Peer resets can surface during either writing or reading on real sockets.
+    for ([_]usize{ 1, 1024 }) |write_buffer_size| {
+        var reset: ResetIo = .{};
+        var vtable = Io.failing.vtable.*;
+        vtable.operate = ResetIo.operate;
+        vtable.netClose = ResetIo.close;
+        const io: Io = .{ .userdata = &reset, .vtable = &vtable };
+        var client: Client = .{ .allocator = testing.allocator, .io = io, .write_buffer_size = write_buffer_size };
+        defer client.deinit();
+
+        const host: HostName = .{ .bytes = "localhost" };
+        const stream: Io.net.Stream = .{
+            .socket = .{
+                // The test backend never passes this synthetic handle to the OS.
+                .handle = if (builtin.os.tag == .windows) @ptrFromInt(1) else 1,
+                .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 80 } },
+            },
+        };
+        const plain = try Connection.Plain.create(&client, host, 80, stream);
+        try client.connection_pool.addUsed(io, &plain.connection);
+        client.connection_pool.release(&plain.connection, io);
+        {
+            var req = try client.request(.GET, try Uri.parse("http://localhost/"), .{});
+            defer req.deinit();
+            try testing.expect(req.connection.?.reused);
+            try testing.expectError(error.WriteFailed, req.sendBodiless());
+            try testing.expectEqual(error.ConnectionResetByPeer, req.connection.?.stream_writer.err.?);
+            try testing.expectEqual(.ready, req.reader.state);
+            try testing.expect(req.connection.?.closing);
+            try testing.expectEqual(@as(usize, 1), reset.writes);
+        }
+        try testing.expectEqual(@as(usize, 1), reset.closes);
+        try testing.expectEqual(@as(usize, 0), client.connection_pool.free_len);
+        try testing.expect(client.connection_pool.used.first == null);
+        try testing.expectEqual(null, try client.connection_pool.findConnection(io, .{ .host = host, .port = 80, .protocol = .plain }));
+    }
+}
