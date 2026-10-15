@@ -78,6 +78,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             n = len(server.requests)
         mode = server.mode
         try:
+            if mode in ('redirect_close_delimited', 'redirect_truncated'):
+                if n == 1:
+                    headers = [(b'Location', b'/redirected')]
+                    if mode == 'redirect_truncated':
+                        headers.append((b'Content-Length', b'100'))
+                    self.write(response(b'302 Found', headers, body=b'prefix'))
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                else:
+                    self.write(success())
+                return
+
             if mode in ('interim_eof', 'interim_timeout'):
                 if n == 1:
                     # An unknown total schedules page 2 on this pooled socket.
@@ -121,6 +133,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # exceeds the redirect buffer remaining after the first URI.
                     headers.append((b'Location', b'/' + b'b' * 7500))
                 self.stall(response(b'302 Found', headers))
+            elif mode == 'overlong_redirect_auth':
+                location = (b'http://' + b'u' * 600 + b'@127.0.0.1:' +
+                            str(server.server_port).encode() + b'/redirected')
+                self.stall(response(b'302 Found', ((b'Location', location),
+                                                 (b'Content-Length', b'1000'))))
             elif mode == 'protocol_switch':
                 self.stall(response(b'101 Switching Protocols', (
                     (b'Connection', b'Upgrade'), (b'Upgrade', b'fixture'))))
@@ -244,6 +261,27 @@ class HttpHeadTests(unittest.TestCase):
                 self.assertEqual(result['metrics']['transport_errors'], 0, result)
                 self.assertEqual(result['metrics']['retries'], 0, result)
                 self.assertEqual(result['traces'][0]['status'], 200, result)
+
+    def test_redirect_eof_follows_on_a_fresh_connection(self):
+        for mode in ('redirect_close_delimited', 'redirect_truncated'):
+            with self.subTest(mode=mode):
+                result = run(self.binary, mode)
+                self.assertEqual(result['exit'], 0, result)
+                self.assertEqual(result['output']['items'], ['sm1'], result)
+                self.assertEqual(len(result['requests']), 2, result)
+                self.assertNotEqual(*result['requests'], result)
+                self.assertEqual(result['metrics']['attempts'], 1, result)
+                self.assertEqual(result['metrics']['transport_errors'], 0, result)
+                self.assertEqual(result['metrics']['transport_replays'], 0, result)
+                self.assertEqual(result['metrics']['retries'], 0, result)
+
+    def test_overlong_redirect_credentials_reject_without_draining_or_retrying(self):
+        result = run(self.binary, 'overlong_redirect_auth', retries=3)
+        self.assert_head_error(result, 'AuthenticationTooLong')
+        self.assertEqual(len(result['requests']), 1, result)
+        self.assertEqual(result['metrics']['attempts'], 1, result)
+        self.assertEqual(result['metrics']['retries'], 0, result)
+        self.assertNotIn('u' * 600, str(result['logs']))
 
     def test_only_final_error_status_is_classified(self):
         for status, metric in ((403, 'http_other'), (500, 'http_5xx')):

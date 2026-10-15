@@ -6,8 +6,10 @@ const domain = @import("domain.zig");
 const scheduler = @import("scheduler.zig");
 const Io = std.Io;
 const version = "v0.03";
+var interrupted: std.atomic.Value(bool) = .init(false);
 
 fn interrupt(_: std.posix.SIG) callconv(.c) void {
+    interrupted.store(true, .release);
     domain.canceled.store(true, .release);
 }
 
@@ -159,6 +161,50 @@ const Runner = struct {
     }
 };
 
+const BufferedOutput = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    cfg: cli.Config,
+    counts: cli.Counts,
+    invalid: []const []const u8,
+    results: []const cli.TargetResult,
+    mutex: Io.Mutex = .init,
+    changed: Io.Condition = .init,
+    done: bool = false,
+
+    fn run(self: *BufferedOutput) !usize {
+        const io = self.io;
+        defer {
+            self.mutex.lockUncancelable(io);
+            self.done = true;
+            self.changed.broadcast(io);
+            self.mutex.unlock(io);
+        }
+        // Failed/canceled writes may retain bytes. Cleanup must not retry them
+        // after the only task supervising stdout cancellation has been joined.
+        errdefer self.out.end = 0;
+        const count = try cli.writeOutput(self.allocator, self.out, self.cfg, self.counts, self.invalid, self.results);
+        try self.out.flush();
+        return count;
+    }
+
+    fn write(self: *BufferedOutput) !usize {
+        const io = self.io;
+        var future = try Io.concurrent(io, BufferedOutput.run, .{self});
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            if (!self.done) self.changed.waitTimeout(io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
+            const done = self.done;
+            self.mutex.unlock(io);
+            if (done) return future.await(io);
+            // Input failures stop fetching but preserve completed output.
+            // Only an external signal cancels a blocked final write.
+            if (interrupted.load(.acquire)) return future.cancel(io);
+        }
+    }
+};
+
 fn fail(err: *Io.Writer, text: []const u8) !u8 {
     try err.print("Error: {s}\n", .{text});
     return 1;
@@ -225,14 +271,12 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
     const counts = runner.counts;
     var output_error = runner.output_error;
     if (!cfg.no_sort or cfg.json) {
-        runner.output_count = cli.writeOutput(a, out, cfg.*, counts, runner.invalid.items, results) catch |e| blk: {
+        var output: BufferedOutput = .{ .allocator = a, .io = init.io, .out = out, .cfg = cfg.*, .counts = counts, .invalid = runner.invalid.items, .results = results };
+        runner.output_count = output.write() catch |e| blk: {
             output_error = e;
             break :blk 0;
         };
     }
-    out.flush() catch |e| {
-        output_error = e;
-    };
     try log_writer.print("{{\"level\":\"INFO\",\"msg\":\"video list\",\"count\":{d}}}\n", .{runner.output_count});
     if (runner.show_progress) try err.writeByte('\n');
     try err.print("summary inputs={d} valid={d} invalid={d} fetch_ok={d} fetch_err={d} output_count={d}\n", .{ counts.total, counts.valid, counts.invalid, runner.fetch_ok, runner.fetch_err, runner.output_count });
@@ -246,6 +290,31 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
     if (output_error) |e| return fail(err, @errorName(e));
     if (cli.exitMessage(cfg.*, counts.invalid, input_error, runner.first_error)) |message| return fail(err, message);
     return 0;
+}
+
+test "buffered output discards bytes after serialization and flush failures" {
+    const FailedWriter = struct {
+        interface: Io.Writer,
+        calls: usize = 0,
+
+        fn drain(writer: *Io.Writer, _: []const []const u8, _: usize) Io.Writer.Error!usize {
+            const self: *@This() = @fieldParentPtr("interface", writer);
+            self.calls += 1;
+            return error.WriteFailed;
+        }
+    };
+    const results = [_]cli.TargetResult{.{ .order = 0, .target = .{ .type = .user, .id = "1" }, .items = &.{ "sm1", "sm2" } }};
+    // Five bytes fails while serializing the second ID; 128 fails at flush.
+    for ([_]usize{ 5, 128 }) |size| {
+        var storage: [128]u8 = undefined;
+        var writer: FailedWriter = .{ .interface = .{ .buffer = storage[0..size], .vtable = &.{ .drain = FailedWriter.drain } } };
+        var output: BufferedOutput = .{ .allocator = std.testing.allocator, .io = std.testing.io, .out = &writer.interface, .cfg = .{ .no_sort = true }, .counts = .{}, .invalid = &.{}, .results = &results };
+        try std.testing.expectError(error.WriteFailed, output.run());
+        try std.testing.expectEqual(@as(usize, 0), writer.interface.end);
+        try std.testing.expectEqual(@as(usize, 1), writer.calls);
+        try writer.interface.flush();
+        try std.testing.expectEqual(@as(usize, 1), writer.calls);
+    }
 }
 
 test {

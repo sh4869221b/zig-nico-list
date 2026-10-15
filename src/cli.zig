@@ -160,7 +160,7 @@ pub fn parse(allocator: Allocator, args: []const []const u8) !Parsed {
                 if (builtin_help) help = b else version = b;
             } else {
                 const idx = found.?;
-                applyFlag(&result.config, idx, value) catch |err| {
+                applyFlag(allocator, &result.config, idx, value) catch |err| {
                     result.error_message = try invalidValue(allocator, flags[idx], value, err);
                     return result;
                 };
@@ -208,7 +208,7 @@ fn durationErrorMessage(a: Allocator, name: []const u8, value: []const u8) ![]co
     return std.fmt.allocPrint(a, "invalid argument \"{s}\" for \"{s}\" flag: time: invalid duration \"{s}\"", .{ value, name, value });
 }
 
-fn applyFlag(cfg: *Config, index: usize, value: []const u8) !void {
+fn applyFlag(allocator: Allocator, cfg: *Config, index: usize, value: []const u8) !void {
     inline for (flags, 0..) |flag, idx| {
         if (index == idx) {
             @field(cfg, flag.field) = switch (flag.kind) {
@@ -216,7 +216,7 @@ fn applyFlag(cfg: *Config, index: usize, value: []const u8) !void {
                 .string => value,
                 .boolean => try parseBool(value),
                 .duration => try parseDuration(value),
-                .float => try parseFloat(value),
+                .float => try parseFloat(allocator, value),
             };
             if (comptime std.mem.eql(u8, flag.name, "concurrency-targets")) cfg.target_explicit = true;
             if (comptime std.mem.eql(u8, flag.name, "concurrency-pages")) cfg.page_explicit = true;
@@ -274,10 +274,25 @@ fn parseInteger(value: []const u8) !i64 {
     return @intCast(n);
 }
 
-fn parseFloat(text: []const u8) !f64 {
-    const value = try std.fmt.parseFloat(f64, text);
+fn parseFloat(allocator: Allocator, text: []const u8) !f64 {
+    const unsigned = if (text.len > 0 and (text[0] == '+' or text[0] == '-')) text[1..] else text;
+    const hexadecimal = unsigned.len >= 2 and unsigned[0] == '0' and (unsigned[1] == 'x' or unsigned[1] == 'X');
+    // strconv.ParseFloat requires a binary exponent for hexadecimal inputs;
+    // Zig's parser also accepts hexadecimal mantissas without one.
+    if (hexadecimal and std.mem.indexOfAny(u8, unsigned, "pP") == null) return error.InvalidCharacter;
+    const value = if (hexadecimal and unsigned.len > 2 and unsigned[2] == '_') blk: {
+        // Go permits one underscore between the hex prefix and its first
+        // digit. Normalize only that spelling for Zig's otherwise shared parser.
+        if (unsigned.len < 4) return error.InvalidCharacter;
+        _ = std.fmt.charToDigit(unsigned[3], 16) catch return error.InvalidCharacter;
+        const normalized = try allocator.alloc(u8, text.len - 1);
+        defer allocator.free(normalized);
+        const prefix_len = text.len - unsigned.len + 2;
+        @memcpy(normalized[0..prefix_len], text[0..prefix_len]);
+        @memcpy(normalized[prefix_len..], text[prefix_len + 1 ..]);
+        break :blk try std.fmt.parseFloat(f64, normalized);
+    } else try std.fmt.parseFloat(f64, text);
     if (std.math.isInf(value)) {
-        const unsigned = if (text.len > 0 and (text[0] == '+' or text[0] == '-')) text[1..] else text;
         if (!std.ascii.eqlIgnoreCase(unsigned, "inf") and !std.ascii.eqlIgnoreCase(unsigned, "infinity")) return error.Overflow;
     }
     if (std.math.isNan(value) and !std.ascii.eqlIgnoreCase(text, "nan")) return error.InvalidCharacter;
@@ -307,17 +322,27 @@ pub fn parseDuration(text: []const u8) error{InvalidDuration}!i64 {
             integral = std.math.add(u128, integral, text[i] - '0') catch return error.InvalidDuration;
             digits += 1;
         }
-        var fraction: u128 = 0;
-        var divisor: u128 = 1;
+        var fraction: u64 = 0;
+        var scale: f64 = 1;
         if (i < text.len and text[i] == '.') {
             i += 1;
-            var frac_digits: usize = 0;
+            var fraction_overflow = false;
             while (i < text.len and std.ascii.isDigit(text[i])) : (i += 1) {
-                if (frac_digits < 18) {
-                    fraction = fraction * 10 + text[i] - '0';
-                    divisor *= 10;
+                // Match Go's leadingFraction: leading zeroes do not consume
+                // precision, and overflowing trailing digits are still read.
+                if (!fraction_overflow) {
+                    if (fraction > std.math.maxInt(i64) / 10) {
+                        fraction_overflow = true;
+                    } else {
+                        const next = fraction * 10 + text[i] - '0';
+                        if (next > @as(u64, 1) << 63) {
+                            fraction_overflow = true;
+                        } else {
+                            fraction = next;
+                            scale *= 10;
+                        }
+                    }
                 }
-                frac_digits += 1;
                 digits += 1;
             }
         }
@@ -335,7 +360,10 @@ pub fn parseDuration(text: []const u8) error{InvalidDuration}!i64 {
             return error.InvalidDuration;
         };
         const integer_ns = std.math.mul(u128, integral, multiplier) catch return error.InvalidDuration;
-        const part = std.math.add(u128, integer_ns, fraction * multiplier / divisor) catch return error.InvalidDuration;
+        // Go uses this float64 scaling to retain nanosecond precision for
+        // fractional hours, including fractions with many leading zeroes.
+        const fraction_ns: u128 = if (fraction == 0) 0 else @intFromFloat(@as(f64, @floatFromInt(fraction)) * (@as(f64, @floatFromInt(multiplier)) / scale));
+        const part = std.math.add(u128, integer_ns, fraction_ns) catch return error.InvalidDuration;
         total = std.math.add(u128, total, part) catch return error.InvalidDuration;
         if (total > @as(u128, 1) << 63) return error.InvalidDuration;
     }
@@ -726,6 +754,18 @@ test "Go duration syntax and overflow boundaries" {
     }
 }
 
+test "Go duration fractions retain precision after leading zeroes" {
+    try std.testing.expectEqual(@as(i64, 1), try parseDuration("0.0000000000002777778h"));
+    try std.testing.expectEqual(@as(i64, -1), try parseDuration("-0.0000000000002777778h"));
+    try std.testing.expectEqual(@as(i64, 1), try parseDuration("0.0000000000166666667m"));
+    try std.testing.expectEqual(@as(i64, 0), try parseDuration("0.0000000000002777777h"));
+    try std.testing.expectEqual(@as(i64, 1_000_000_000), try parseDuration("0.999999999999999999999999999999s"));
+    try std.testing.expectEqual(std.math.maxInt(i64), try parseDuration("9223372036.854775807s"));
+    try std.testing.expectEqual(std.math.minInt(i64), try parseDuration("-9223372036.854775808s"));
+    try std.testing.expectError(error.InvalidDuration, parseDuration("9223372036.854775808s"));
+    try std.testing.expectError(error.InvalidDuration, parseDuration("-9223372036.854775809s"));
+}
+
 test "validation and strict best-effort precedence" {
     var cfg: Config = .{};
     try std.testing.expectEqual(@as(?[]const u8, null), try validate(std.testing.allocator, &cfg));
@@ -890,10 +930,21 @@ test "integer syntax and precise parser diagnostics" {
 }
 
 test "floating point parsing matches Go special values and range errors" {
-    try std.testing.expect(std.math.isInf(try parseFloat("Infinity")));
-    try std.testing.expect(std.math.isInf(try parseFloat("+INF")));
-    try std.testing.expect(std.math.isNan(try parseFloat("nan")));
-    try std.testing.expectError(error.InvalidCharacter, parseFloat("+NaN"));
-    try std.testing.expectError(error.InvalidCharacter, parseFloat("1__2"));
-    try std.testing.expectError(error.Overflow, parseFloat("1e9999"));
+    try std.testing.expect(std.math.isInf(try parseFloat(std.testing.allocator, "Infinity")));
+    try std.testing.expect(std.math.isInf(try parseFloat(std.testing.allocator, "+INF")));
+    try std.testing.expect(std.math.isNan(try parseFloat(std.testing.allocator, "nan")));
+    try std.testing.expectError(error.InvalidCharacter, parseFloat(std.testing.allocator, "+NaN"));
+    try std.testing.expectError(error.InvalidCharacter, parseFloat(std.testing.allocator, "1__2"));
+    try std.testing.expectError(error.Overflow, parseFloat(std.testing.allocator, "1e9999"));
+}
+
+test "Go hexadecimal floats require a binary exponent" {
+    for ([_][]const u8{ "0x0", "0x1", "0x1.8", "-0x1", "+0X1.8", "0x_.1p0", "0x__1p0" }) |text| {
+        try std.testing.expectError(error.InvalidCharacter, parseFloat(std.testing.allocator, text));
+    }
+    try std.testing.expectEqual(@as(f64, 1), try parseFloat(std.testing.allocator, "0x1p0"));
+    try std.testing.expectEqual(@as(f64, 3), try parseFloat(std.testing.allocator, "+0X1.8P+1"));
+    try std.testing.expectEqual(@as(f64, -0.75), try parseFloat(std.testing.allocator, "-0x1.8p-1"));
+    try std.testing.expectEqual(@as(f64, 1), try parseFloat(std.testing.allocator, "0x_1p0"));
+    try std.testing.expectEqual(@as(f64, -0.75), try parseFloat(std.testing.allocator, "-0x_1.8p-1"));
 }

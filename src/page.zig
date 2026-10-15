@@ -149,12 +149,12 @@ const Decoder = struct {
         }
         if (Schema == Timestamp) {
             if (kind != .string) return error.UnexpectedToken;
-            const token = try self.scanner.nextAllocMax(self.allocator, .alloc_if_needed, self.scanner.input.len);
-            const text = switch (token) {
-                .string, .allocated_string => |value| value,
-                else => unreachable,
-            };
-            defer if (token == .allocated_string) self.allocator.free(text);
+            // Go's time.Time.UnmarshalJSON strips quotes but does not decode
+            // JSON escapes. Validate the original token, without allocating an
+            // unescaped string that would accept a broader timestamp syntax.
+            const start = self.scanner.cursor;
+            try self.scanner.skipValue();
+            const text = self.scanner.input[start + 1 .. self.scanner.cursor - 1];
             const unix = date_time.parseTimestamp(text) catch return error.UnexpectedToken;
             if (Projected != void) projection.unix = unix;
             return;
@@ -556,6 +556,27 @@ test "invalid timestamps fail before filtering or duplicate overwrite" {
         "{\"data\":{\"items\":[{\"essential\":{\"registeredAt\":\"invalid\",\"registeredAt\":\"2025-01-02T03:04:05Z\"}}]}}",
         "{\"data\":{\"items\":[{\"essential\":{\"registeredAt\":\"\"}}]}}",
     }) |body| try testing.expectError(error.UnexpectedToken, parseTest(body, false));
+}
+
+test "timestamp JSON escapes remain invalid like Go time.Time" {
+    // time.Time.UnmarshalJSON parses the quoted token without unescaping it.
+    // These strings decode to valid RFC3339 but must still fail the page,
+    // including when a later duplicate would replace the timestamp.
+    for ([_]bool{ false, true }) |is_mylist| {
+        for ([_][]const u8{
+            "2025-01-02T03:04:05\\u005a",
+            "\\u0032025-01-02T03:04:05Z",
+            "2025-01-02\\u005403:04:05Z",
+            "2025-01-02T03:04:05.\\u0031Z",
+        }) |timestamp| {
+            const item = if (is_mylist) "video" else "essential";
+            const nesting = if (is_mylist) "\"mylist\":{" else "";
+            const closing = if (is_mylist) "}" else "";
+            const body = try std.fmt.allocPrint(testing.allocator, "{{\"data\":{{{s}\"items\":[{{\"{s}\":{{\"registeredAt\":\"{s}\",\"registeredAt\":\"2025-01-02T03:04:05Z\"}}}}]{s}}}}}", .{ nesting, item, timestamp, closing });
+            defer testing.allocator.free(body);
+            try testing.expectError(error.UnexpectedToken, parseTest(body, is_mylist));
+        }
+    }
 }
 
 test "known schema field type errors are rejected even if unused" {

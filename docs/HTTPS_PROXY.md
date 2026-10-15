@@ -19,7 +19,7 @@ its std import and adds a dedicated HTTPS-over-HTTP-proxy path. It also tracks
 actual pool reuse and response heads and supports bypassing pool lookup for one
 bounded stale-socket GET replay, and discards sockets after failed sends; see
 HTTP_DIAGNOSTICS.md. It retains the
-standard library's HTTP parsing, direct TLS implementation, system certificate
+standard library's direct TLS implementation, system certificate
 bundle, hostname verification, TLS settings and pooling. It does not patch the
 installed compiler or system settings, shell out to another HTTP executable,
 disable proxy routing or weaken certificate verification.
@@ -38,6 +38,19 @@ The repair:
 - Initializes CA/time state on the connection path as well as the initial request
   path, so an HTTP-to-HTTPS redirect also receives normal TLS verification.
 - Keeps the scheduler's per-attempt timeout and cancellation ownership unchanged.
+
+For plain HTTP origins, CONNECT also receives configured proxy authorization.
+Failed CONNECT sockets are closed without draining an untrusted response body
+before the existing HTTP forwarding fallback. Cancellation stops this fallback,
+and shared CONNECT capability state is synchronized. Only an established tunnel
+can be pooled under the origin identity.
+
+Response `Connection` tokens are parsed across comma-separated lists and repeated
+fields, with `close` taking precedence. An incomplete redirect response body also
+closes its old socket before following the redirect on another connection.
+Overlong URI credentials are rejected before connecting or draining a redirect
+body, rather than overflowing the bounded Basic-auth scratch buffer. The same
+validation applies to configured proxy credentials.
 
 ## Supported configuration
 

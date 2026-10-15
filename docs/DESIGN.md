@@ -68,6 +68,14 @@ and it joins the sink before releasing borrowed page memory or emitting another
 event. The sink releases the diagnostic mutex before writing stdout, so canceled
 HTTP jobs can log and finish independently. Caller cancellation also cancels a
 blocked sink; failed writes are not flushed again from a later cleanup path.
+After fetching finishes, sorted line output and JSON serialization plus their
+final flush run in one awaited output task with the same signal polling. A full
+stdout pipe therefore remains interruptible through the end of the command;
+failed final writes also discard retained writer bytes before cleanup.
+Final-output interruption watches a separate signal flag. Input-read errors stop
+fetching through the shared shutdown flag, but completed results are fully
+written before reporting that input error. SIGINT/SIGTERM can still interrupt
+the final write even after an input error has stopped fetching.
 
 Io.Future.cancel cancellation is consumed at the next cancellation point, and
 std.http may wrap it in ReadFailed. The owning Deadline therefore preserves the
@@ -126,6 +134,9 @@ page metadata are retained. Unknown fields are syntactically skipped. Interface
 JSON numbers retain the Go float64-overflow rule without building value trees.
 Escaped field names use bounded stack storage; selected IDs are decoded/copied
 once into the output owner. The final ID slice is exactly sized.
+Timestamp values are validated from their original quoted token, matching Go's
+time.Time JSON decoder: JSON escapes within a timestamp remain invalid even if
+they would decode to RFC3339 or a later duplicate would overwrite the value.
 
 Duplicate struct merge, null retention, Unicode repair/folding, and mylist
 fallbacks are preserved. Duplicate arrays now match Go's reused item slots,
