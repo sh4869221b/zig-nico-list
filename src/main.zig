@@ -1,4 +1,5 @@
 const std = @import("std");
+const HttpClient = @import("http_client.zig");
 const builtin = @import("builtin");
 const cli = @import("cli.zig");
 const domain = @import("domain.zig");
@@ -112,13 +113,17 @@ const Runner = struct {
         if (self.cfg.no_sort and !self.cfg.json and result.error_message.len > 0)
             result.error_message = try self.ctx.result_allocator.dupe(u8, result.error_message);
         self.mutex.lockUncancelable(self.init.io);
-        defer self.mutex.unlock(self.init.io);
         if (result.error_message.len > 0) {
             self.fetch_err += 1;
             if (self.first_error == null) self.first_error = result.error_message;
             self.logLocked("ERROR", "failed to get video list", result.error_message) catch {};
         } else self.fetch_ok += 1;
+        self.mutex.unlock(self.init.io);
+        // Only the sink task owns stdout, dedupe state and output counters.
+        // Keep the diagnostic mutex free while stdout is backpressured so page
+        // jobs can log and finish when the coordinator cancels/joins them.
         if (self.cfg.no_sort and !self.cfg.json and self.output_error == null) {
+            var write_failed = false;
             for (result.items) |id| {
                 if (self.cfg.dedupe) {
                     const item = self.seen.getOrPut(self.ctx.result_allocator, id) catch |err| {
@@ -133,15 +138,22 @@ const Runner = struct {
                 }
                 cli.writeLines(self.out, &.{id}, self.cfg.url) catch |err| {
                     self.output_error = err;
+                    write_failed = true;
                     break;
                 };
                 self.output_count += 1;
             }
-            self.out.flush() catch |err| {
+            if (!write_failed) self.out.flush() catch |err| {
                 self.output_error = err;
+                write_failed = true;
             };
+            // A failed/canceled write may retain buffered bytes. Retrying them
+            // in run/main would block again after a graceful interrupt.
+            if (write_failed) self.out.end = 0;
             if (self.output_error != null) domain.canceled.store(true, .release);
         }
+        self.mutex.lockUncancelable(self.init.io);
+        defer self.mutex.unlock(self.init.io);
         self.completed += 1;
         self.progress();
     }
@@ -184,7 +196,7 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
         log_writer = &file_writer.interface;
     }
     var control = domain.Control.init(init.io, cfg);
-    var client: std.http.Client = .{ .allocator = init.gpa, .io = init.io };
+    var client: HttpClient = .{ .allocator = init.gpa, .io = init.io };
     defer client.deinit();
     try client.initDefaultProxies(a, init.environ_map);
     // Environment proxies must not intercept deterministic localhost fixtures.

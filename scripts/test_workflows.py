@@ -69,6 +69,20 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertNotIn("reproducibility.yml", self.read(name))
             self.assertNotIn("python scripts/check_build.py", self.read(name))
 
+    def test_every_integration_workflow_prepares_required_tls_fixtures(self):
+        for name in ("native.yml", "reproducibility.yml"):
+            with self.subTest(workflow=name):
+                text = self.read(name)
+                dependencies = text.index("python -m pip install --disable-pip-version-check -r tests/requirements.txt")
+                probe = text.index("run: zig build tls-probe ")
+                integration = text.index("run: python tests/integration.py ")
+                self.assertLess(dependencies, probe)
+                self.assertLess(probe, integration)
+                for step in ("Install TLS fixture dependencies", "Build the isolated TLS fixture client"):
+                    block = text.split(f"      - name: {step}\n", 1)[1].split("      - name:", 1)[0]
+                    self.assertNotIn("continue-on-error", block)
+                    self.assertNotIn("if:", block)
+
     def test_permissions_cache_writes_and_concurrency_remain_bounded(self):
         for file in WORKFLOWS.glob("*.yml"):
             text = file.read_text(encoding="utf-8")

@@ -1,15 +1,18 @@
-//! Single-owner target/page state machine. Only page jobs perform blocking I/O.
+//! Single-owner target/page state machine. Page jobs and one sink task perform I/O.
 //! There are no target, page-admission, request, or timeout wrapper tasks.
 //! Each job owns its arena; ownership moves to its target after join. The
 //! scheduler is also the single deadline supervisor and the only result writer.
 const std = @import("std");
+const HttpClient = @import("http_client.zig");
 const cli = @import("cli.zig");
 const domain = @import("domain.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 pub const Event = union(enum) { input: []const u8, complete: *cli.TargetResult };
-/// Events are emitted synchronously by the coordinator, never by page jobs.
+/// The coordinator waits for each event's sink task before emitting another.
+/// While waiting it continues to supervise page deadlines and cancellation.
+/// Page jobs never emit events, and there is no output queue.
 /// Input strings and result records are borrowed until Scheduler.deinit. Page
 /// ID/error storage also lives until deinit for buffered output, but in no-sort
 /// non-JSON mode it is released as soon as the complete callback returns. A sink
@@ -78,6 +81,19 @@ pub const Scheduler = struct {
             std.debug.assert(job.joined);
             job.arena.deinit();
             allocator.destroy(job);
+        }
+    };
+    const Emission = struct {
+        scheduler: *Scheduler,
+        event: Event,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *Emission) anyerror!void {
+            defer {
+                self.done.store(true, .release);
+                self.scheduler.wake();
+            }
+            try self.scheduler.sink.emit(self.scheduler.sink.context, self.event);
         }
     };
 
@@ -205,7 +221,7 @@ pub const Scheduler = struct {
         if (target.canceled) target.result.error_message = "";
         target.finished = true;
         self.active -= 1;
-        try self.sink.emit(self.sink.context, .{ .complete = &target.result });
+        try self.emit(.{ .complete = &target.result });
         if (self.ctx.cfg.no_sort and !self.ctx.cfg.json) {
             // The sink copied only persistent dedupe/error keys before this.
             for (target.jobs.items) |job| job.deinit(self.allocator);
@@ -213,6 +229,47 @@ pub const Scheduler = struct {
             target.ids.clearAndFree(self.allocator);
             target.result.items = &.{};
         }
+    }
+    fn emit(self: *Scheduler, event: Event) !void {
+        // This stack-owned event and its borrowed page arenas remain alive
+        // until the only sink task is joined, including cancellation/errors.
+        // Backpressure stops admission, but cannot stop HTTP supervision.
+        var emission: Emission = .{ .scheduler = self, .event = event };
+        var future = try Io.concurrent(self.ctx.io, Emission.run, .{&emission});
+        while (!emission.done.load(.acquire)) {
+            self.mutex.lockUncancelable(self.ctx.io);
+            const epoch = self.epoch;
+            self.mutex.unlock(self.ctx.io);
+            const cancel_all = domain.canceled.load(.acquire);
+            for (self.targets.items) |target| {
+                if (!target.finished) self.joinReady(target, cancel_all);
+            }
+            if (cancel_all) {
+                self.input_future.?.cancel(self.ctx.io);
+                // A stalled stdout write must also respond to SIGINT. The sink
+                // owns the writer until this joins and handles write failures.
+                return future.cancel(self.ctx.io);
+            }
+            self.waitForChange(epoch);
+        }
+        try future.await(self.ctx.io);
+    }
+    fn waitForChange(self: *Scheduler, epoch: u64) void {
+        // Completion notifications wake immediately. This bounded wait also
+        // supervises request deadlines and the signal-safe cancellation bit.
+        var wait_ns: i64 = 20_000_000;
+        const timestamp = domain.now(self.ctx.io);
+        for (self.targets.items) |target| {
+            if (target.finished) continue;
+            for (target.jobs.items[target.next_commit..]) |job| {
+                if (job.joined) continue;
+                const deadline = job.deadline.expires.load(.acquire);
+                if (deadline > 0) wait_ns = @min(wait_ns, @max(0, deadline - timestamp));
+            }
+        }
+        self.mutex.lockUncancelable(self.ctx.io);
+        if (self.epoch == epoch and wait_ns > 0) self.changed.waitTimeout(self.ctx.io, &self.mutex, .{ .duration = .{ .raw = .fromNanoseconds(wait_ns), .clock = .awake } }) catch {};
+        self.mutex.unlock(self.ctx.io);
     }
     pub fn run(self: *Scheduler, inputs: []const []const u8) !?[]const u8 {
         self.input_future = try Io.concurrent(self.ctx.io, readInputs, .{ self, inputs });
@@ -245,7 +302,7 @@ pub const Scheduler = struct {
                     self.changed.broadcast(self.ctx.io);
                 }
                 self.mutex.unlock(self.ctx.io);
-                if (announce) try self.sink.emit(self.sink.context, .{ .input = value.? });
+                if (announce) try self.emit(.{ .input = value.? });
                 if (can_accept) {
                     if (cli.parseTarget(value.?)) |parsed| {
                         const target = try self.allocator.create(Target);
@@ -271,21 +328,7 @@ pub const Scheduler = struct {
             self.mutex.unlock(self.ctx.io);
             self.ctx.control.setWorkerPending(waiting_pages + @as(usize, @intFromBool(has_pending)));
             if (self.active == 0 and (cancel_all or input_done and !has_pending)) break;
-            // Completion notifications wake immediately. This bounded wait also
-            // supervises request deadlines and the signal-safe cancellation bit.
-            var wait_ns: i64 = 20_000_000;
-            const timestamp = domain.now(self.ctx.io);
-            for (self.targets.items) |target| {
-                if (target.finished) continue;
-                for (target.jobs.items[target.next_commit..]) |job| {
-                    if (job.joined) continue;
-                    const deadline = job.deadline.expires.load(.acquire);
-                    if (deadline > 0) wait_ns = @min(wait_ns, @max(0, deadline - timestamp));
-                }
-            }
-            self.mutex.lockUncancelable(self.ctx.io);
-            if (self.epoch == epoch and wait_ns > 0) self.changed.waitTimeout(self.ctx.io, &self.mutex, .{ .duration = .{ .raw = .fromNanoseconds(wait_ns), .clock = .awake } }) catch {};
-            self.mutex.unlock(self.ctx.io);
+            self.waitForChange(epoch);
         }
         self.input_future.?.await(self.ctx.io);
         self.ctx.control.setWorkerPending(0);
@@ -298,7 +341,7 @@ test "ordered commit ignores a later canceled page after an empty terminal page"
     const io = std.testing.io;
     const cfg: cli.Config = .{ .concurrency_pages = 4 };
     var control = domain.Control.init(io, &cfg);
-    var client: std.http.Client = .{ .allocator = a, .io = io };
+    var client: HttpClient = .{ .allocator = a, .io = io };
     defer client.deinit();
     var unused: u8 = 0;
     var engine = Scheduler.init(a, .{ .result_allocator = a, .temporary = a, .io = io, .cfg = &cfg, .control = &control, .client = &client }, .{ .context = &unused, .emit = struct {

@@ -25,10 +25,12 @@ Zig 0.17.0を使用します。
 ```sh
 zig build -Doptimize=fast -Dcpu=baseline
 zig build test -Doptimize=safe
+python -m pip install -r tests/requirements.txt
+zig build tls-probe -Doptimize=fast -Dcpu=baseline
 python tests/integration.py zig-out/bin/zig-nico-list
 ```
 
-Windowsのテスト実行時は末尾を `zig-nico-list.exe` にします。
+Windowsのテスト実行時は末尾を `zig-nico-list.exe` にします。TLS・プロキシ回帰テストは開発用依存 `cryptography` で一時的な証明書と鍵を生成します。鍵をリポジトリへ保存せず、OSの信頼ストアも変更しません。`tls-probe` はテスト専用で、配布実行ファイルには含めません。
 
 CIはWindows/Linuxのネイティブ環境でユニット・ローカルHTTP統合テストを実行します。実サービスへアクセスするテストではありません。ログ文面、時刻表示、進捗表示、HTTPメトリクスの詳細形式はGo版と異なります。Windowsのコンソール割り込みは通常のOS終了動作を使用します。
 
@@ -45,3 +47,5 @@ CIはWindows/Linuxのネイティブ環境でユニット・ローカルHTTP統�
 通常の「Test CI」はmainへのpush、main宛PRの作成・更新・再オープン・編集、または手動実行で起動します。feature branchへのpush単独やタグpushでは起動しません。変更ファイルに応じてユニット、実行ファイル＋統合テスト、Python、Zig整形、文書チェックを選び、文書のみの変更ではZigビルドを省略します。手動実行は全検証です。集約チェック「CI」は省略されたジョブと失敗を区別します。
 
 releaseはv＋数字で始まるタグpushまたは明示的な手動実行で、変更箇所にかかわらず全検証を実施してからdraftを作成します。cold再現性検証は引き続き手動専用です。定期実行、branch protection、権限やsecretsの設定は変更していません。
+
+再利用した接続が応答ヘッダーを一切返さず終了した場合に限り、元のタイムアウト期限内で新しい接続へGETを1回だけ再送します。再送開始数は`transport_replays`で記録し、通常の試行・再試行数と区別します。部分的なヘッダー、403/429などの応答、本文エラーやタイムアウトはこの再送の対象外です。ローカル再現で確認した改善であり、過去のWindows実行の原因を確定するものではありません。

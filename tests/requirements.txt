@@ -1,0 +1,2 @@
+# Development-only certificate generation for loopback TLS/proxy regressions.
+cryptography==50.0.0

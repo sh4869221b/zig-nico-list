@@ -33,10 +33,12 @@ Use **Zig 0.17.0**, pinned by archive checksums in `scripts/install_zig.py`.
 ```sh
 zig build -Doptimize=fast -Dcpu=baseline
 zig build test -Doptimize=safe
+python -m pip install -r tests/requirements.txt
+zig build tls-probe -Doptimize=fast -Dcpu=baseline
 python tests/integration.py zig-out/bin/zig-nico-list
 ```
 
-On Windows, use `zig-out/bin/zig-nico-list.exe` in the final command. Python 3.12+ is only needed for development tests and release packaging; the application has no third-party runtime dependencies.
+On Windows, use `zig-out/bin/zig-nico-list.exe` in the final command. Python 3.12+ and the pinned `cryptography` test dependency generate temporary certificates for loopback TLS/proxy tests. The `tls-probe` executable is a test helper. The application has no third-party runtime dependencies.
 
 `ci.yml` runs on `main` pushes, PRs targeting `main`, or manual dispatch. It selects lightweight checks and cached native unit/executable jobs from the changed paths; documentation-only changes skip Zig builds. A stable `CI` check gathers the results. Manual runs execute all checks. Native executable builds always run integration tests. `release.yml` uses the same cached checks for the exact tag commit, verifies fresh executable/source identities and archive hashes, and prepares a draft release. Cold two-build reproducibility is a separate manual `reproducibility.yml` workflow, outside normal CI; normal CI success does not establish cold-build or independent-machine reproducibility. See [CI and verification contracts](scripts/README.md).
 
@@ -45,6 +47,8 @@ On Windows, use `zig-out/bin/zig-nico-list.exe` in the final command. Python 3.1
 - Normal line output and the JSON schema follow the Go baseline. Diagnostic wording, timestamps, progress animation, and HTTP metrics field layout differ.
 - HTTP metrics count attempts separately from page-job outcomes. `http_other` covers response statuses outside 200, 404, 429 and 5xx; error-status attempts are logged with their numeric status. Client timeouts are reported as failed targets (nonzero exit unless `--best-effort`), retaining any successfully committed page prefix.
 - `--http-metrics` writes aggregate measurements and safe per-attempt JSON diagnostics. See [HTTP diagnostics](docs/HTTP_DIAGNOSTICS.md) for timing, retry, connection and adaptive-history semantics. Separate DNS/TCP/TLS/first-byte tracing and recent-window quantiles are not implemented.
+- A reused socket closed before any response can replay its GET once on a fresh connection within the original deadline, with separate transport-replay metrics.
+- HTTPS through HTTP CONNECT proxies establishes and verifies origin TLS. HTTPS-scheme proxy endpoints are explicitly unsupported; failed CONNECT never falls back to plaintext. See [HTTPS proxy security](docs/HTTPS_PROXY.md).
 - `NICO_BASE_URL` is a development/test override. The production default is `https://nvapi.nicovideo.jp/v3`.
 - Tests use deterministic localhost fixtures. CI does not make requests to the live niconico service and does not establish live-service compatibility or performance.
 - Graceful signal-driven cancellation is explicitly installed on POSIX Linux/macOS. Windows uses the platform's normal process termination behavior for console interrupts.

@@ -17,6 +17,8 @@ response representation, allocator boundaries, and sort pipeline are rebuilt.
   termination, task lifecycle, deadline supervision, target-completion events.
 - `domain.zig`: HTTP requests, retries, rate/admission policy, metrics, typed
   attempt-deadline ownership. It contains no target/page task graph.
+- `http_client.zig`: pinned Zig HTTP client with a narrow authenticated
+  CONNECT-to-origin-TLS repair and bounded stale-connection replay support; see [HTTPS proxy transport](HTTPS_PROXY.md).
 - `page.zig`: complete wire-schema definitions, validating token projection,
   selected-ID ownership and filters.
 - `id_order.zig`: borrowed sort-key decoration, ordering, scratch allocation.
@@ -31,7 +33,8 @@ decision buffer. Admission synchronization and snapshot assembly stay within
 ## Flat work graph
 
 One input task feeds a single-entry acknowledged mailbox. The coordinator owns
-all target states and output. A target is data, not an OS thread. Each eligible
+all target states and hands each output event to one awaited sink task. A target
+is data, not an OS thread. Each eligible
 page gets one I/O job; requests and retry sleeps run directly in that job. There
 are no nested target, page-coordinator, request-wrapper, or per-request timer
 tasks. Completed jobs wake the coordinator via an Io.Condition.
@@ -58,13 +61,24 @@ Starting a deadline wakes the coordinator; its condition wait uses the nearest
 active deadline, with a 20 ms maximum signal-poll interval. Completion checks
 its own timestamp as well, so a short timeout cannot be missed between polls.
 
+The coordinator continues deadline and cancellation supervision while its one
+sink task emits an event, including when stdout is blocked. It does not admit
+more input or launch more page work during emission. There is no output queue,
+and it joins the sink before releasing borrowed page memory or emitting another
+event. The sink releases the diagnostic mutex before writing stdout, so canceled
+HTTP jobs can log and finish independently. Caller cancellation also cancels a
+blocked sink; failed writes are not flushed again from a later cleanup path.
+
 Io.Future.cancel cancellation is consumed at the next cancellation point, and
 std.http may wrap it in ReadFailed. The owning Deadline therefore preserves the
 reason independently of the transport error. Client timeout stays Timeout for
 adaptive overload feedback and is propagated as a terminal page failure. It is
 not retried inside the canceled page future: the supervisor is joining that
-future and cannot supervise a new attempt there. Other transport errors retain
-the configured attempt/backoff budget. Caller cancellation stays neutral.
+future and cannot supervise a new attempt there. A zero-byte response-head EOF on a reused socket can replay the GET once on a
+fresh connection within the original active deadline. Partial headers, responses,
+body failures and fresh-connection failures never enter this replay path. Other
+transport errors retain the configured attempt/backoff budget. Failed sends mark
+the connection closing before cleanup so later retries cannot reuse a broken socket. Caller cancellation stays neutral.
 A failed target retains its successfully committed page prefix, carries an
 error in JSON and diagnostics, and increments fetch_err. The default exit is
 nonzero; explicit --best-effort keeps its existing exit-code override. Error/404 response
@@ -77,7 +91,7 @@ initial/recent adaptive history.
 ## Memory ownership
 
 - Invocation arena: configuration, durable errors/dedupe keys, output metadata;
-  mutated only by the coordinator.
+  mutated only by the coordinator or its awaited sink during ownership handoff.
 - Input arena: scanner and input strings; mutated only by the input task, kept
   alive through final output.
 - Page-job arena: selected IDs and page result; mutated by exactly one job.
@@ -89,11 +103,14 @@ initial/recent adaptive history.
 replaces it with its exclusive arena; the coordinator's copy uses the invocation
 arena. `Context.temporary` is for operation-local bodies and parsing scratch.
 
-`Sink.emit` is synchronous and called only by the coordinator. Input strings and
+`Sink.emit` runs in a single task awaited by the coordinator. Input strings and
 result records are borrowed until scheduler teardown. Buffered page bytes share
-that lifetime, but no-sort non-JSON page bytes are released immediately after the
-completion callback. The sink copies any dedupe keys or errors it must retain
-before returning, and may replace the result's error slice with its durable copy.
+that lifetime, but no-sort non-JSON page bytes are released only after the
+completion callback has been joined. The sink copies any dedupe keys or errors
+it must retain before returning, and may replace the result's error slice with
+its durable copy. While the sink owns invocation/output allocations, the
+coordinator only supervises and joins page jobs; it does not allocate or commit
+page results into the invocation arena.
 
 No two jobs mutate one ArenaAllocator. Unordered non-JSON target output is
 emitted at completion, then its page arenas and ID arrays are released. Input
