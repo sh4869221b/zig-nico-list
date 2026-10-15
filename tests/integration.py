@@ -242,6 +242,21 @@ class CliIntegration(unittest.TestCase):
             self.assertEqual(server.requests, [1])
             self.assertEqual(result.stdout, '')
 
+    def test_escaped_timestamp_fails_before_filtering(self):
+        for target in (USER, MYLIST):
+            with self.subTest(target=target):
+                payload = body(('sm1',), mylist=target == MYLIST).replace(
+                    b'2024-01-01T00:00:00Z', b'2024-01-01T00:00:00\\u005a')
+                def reply(page, *_):
+                    return 200, payload if page == 1 else body((), mylist=target == MYLIST), {}, False
+                with fixture(reply) as server:
+                    result = command(server, '--comment', '100', target)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertEqual(server.requests, [1])
+                    self.assertIn('fetch_ok=0 fetch_err=1', result.stderr)
+                    self.assertIn('failed to unmarshal response body', result.stderr)
+
     def test_timeout_reports_failed_target(self):
         with fixture(lambda *_: (200, body(), {}, True)) as server:
             result = command(server, '--timeout', '100ms', '--json', USER)

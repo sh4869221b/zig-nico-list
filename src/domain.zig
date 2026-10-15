@@ -699,6 +699,7 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
             // would have no deadline supervisor while that join is in progress.
             // A client timeout is a failure, never successful caller cancellation.
             if (err == error.Canceled or err == error.Timeout or
+                err == error.AuthenticationTooLong or
                 err == error.HttpsProxyUnsupported or err == error.ProxyTunnelRefused or
                 err == error.ProxyAuthenticationRequired or err == error.ProxyTunnelUnexpectedData) return err;
             last_error = err;

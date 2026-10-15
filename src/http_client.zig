@@ -550,6 +550,7 @@ pub const Response = struct {
                 .@"HTTP/1.0" => false,
                 .@"HTTP/1.1" => true,
             };
+            var connection_close = false;
 
             while (it.next()) |line| {
                 if (line.len == 0) return res;
@@ -564,7 +565,13 @@ pub const Response = struct {
                 if (header_name.len == 0) return error.HttpHeadersInvalid;
 
                 if (std.ascii.eqlIgnoreCase(header_name, "connection")) {
-                    res.keep_alive = !std.ascii.eqlIgnoreCase(header_value, "close");
+                    var tokens = mem.splitScalar(u8, header_value, ',');
+                    while (tokens.next()) |token| {
+                        const value = mem.trim(u8, token, " \t");
+                        if (std.ascii.eqlIgnoreCase(value, "close")) connection_close = true;
+                        if (std.ascii.eqlIgnoreCase(value, "keep-alive")) res.keep_alive = true;
+                    }
+                    if (connection_close) res.keep_alive = false;
                 } else if (std.ascii.eqlIgnoreCase(header_name, "content-type")) {
                     res.content_type = header_value;
                 } else if (std.ascii.eqlIgnoreCase(header_name, "location")) {
@@ -725,6 +732,23 @@ pub const Response = struct {
             }
             for ([_][]const u8{ "HTTP/1.1 200\r\n\r\n", "HTTP/1.1 200 \r\n\r\n" }) |response| {
                 try testing.expectEqual(.ok, (try Head.parse(response)).status);
+            }
+        }
+
+        test "Connection tokens honor close across lists and repeated fields" {
+            const Case = struct { version: []const u8, headers: []const u8, keep_alive: bool };
+            for ([_]Case{
+                .{ .version = "1.1", .headers = "", .keep_alive = true },
+                .{ .version = "1.1", .headers = "Connection: keep-alive, CLOSE\r\n", .keep_alive = false },
+                .{ .version = "1.1", .headers = "Connection: close\r\nConnection: keep-alive\r\n", .keep_alive = false },
+                .{ .version = "1.1", .headers = "Connection: keep-alive\r\nConnection: close\r\n", .keep_alive = false },
+                .{ .version = "1.0", .headers = "Connection: upgrade\r\n", .keep_alive = false },
+                .{ .version = "1.0", .headers = "Connection: Upgrade,\tKEEP-ALIVE\t\r\n", .keep_alive = true },
+                .{ .version = "1.0", .headers = "Connection: keep-alive, close\r\n", .keep_alive = false },
+            }) |case| {
+                var buffer: [256]u8 = undefined;
+                const bytes = try std.fmt.bufPrint(&buffer, "HTTP/{s} 200 OK\r\n{s}\r\n", .{ case.version, case.headers });
+                try testing.expectEqual(case.keep_alive, (try Head.parse(bytes)).keep_alive);
             }
         }
 
@@ -1270,6 +1294,7 @@ pub const Request = struct {
         };
 
         const protocol = Protocol.fromUri(new_uri) orelse return error.UnsupportedUriScheme;
+        try basic_authorization.validate(new_uri);
         const old_connection = r.connection.?;
         const old_host = old_connection.host();
         var new_host_name_buffer: [HostName.max_len]u8 = undefined;
@@ -1295,6 +1320,9 @@ pub const Request = struct {
             _ = reader.discardRemaining() catch |err| switch (err) {
                 error.ReadFailed => return r.reader.body_err orelse error.ReadFailed,
             };
+            // EOF can delimit this body or arrive before Content-Length bytes.
+            // In either case the socket cannot carry the redirected request.
+            if (r.reader.state != .ready) old_connection.closing = true;
         }
 
         r.client.connection_pool.release(old_connection, io);
@@ -1346,6 +1374,21 @@ pub const Proxy = struct {
     authorization: ?[]const u8,
     port: u16,
     supports_connect: bool,
+    /// Capability learning is shared by concurrent requests and may be shared
+    /// by more than one Client. Initialize before use, then access under lock.
+    mutex: Io.Mutex = .init,
+
+    fn supportsConnect(proxy: *Proxy, io: Io) bool {
+        proxy.mutex.lockUncancelable(io);
+        defer proxy.mutex.unlock(io);
+        return proxy.supports_connect;
+    }
+
+    fn setSupportsConnect(proxy: *Proxy, io: Io, value: bool) void {
+        proxy.mutex.lockUncancelable(io);
+        defer proxy.mutex.unlock(io);
+        proxy.supports_connect = value;
+    }
 };
 
 /// Release all associated resources with the client.
@@ -1405,8 +1448,10 @@ fn createProxyFromEnvVar(
     const raw_host = try HostName.fromUri(uri, &host_buf);
 
     const authorization: ?[]const u8 = if (uri.user != null or uri.password != null) a: {
+        try basic_authorization.validate(uri);
         const authorization = try arena.alloc(u8, basic_authorization.valueLengthFromUri(uri));
-        assert(basic_authorization.value(uri, authorization).len == authorization.len);
+        const written = try basic_authorization.value(uri, authorization);
+        assert(written.len == authorization.len);
         break :a authorization;
     } else null;
 
@@ -1446,9 +1491,20 @@ pub const basic_authorization = struct {
         return valueLength(@intCast(user_len), @intCast(password_len));
     }
 
-    pub fn value(uri: Uri, out: []u8) []u8 {
+    pub fn validate(uri: Uri) error{AuthenticationTooLong}!void {
+        var buffer: [max_user_len + 1 + max_password_len]u8 = undefined;
+        var writer: Writer = .fixed(&buffer);
+        const user: Uri.Component = uri.user orelse .empty;
+        const password: Uri.Component = uri.password orelse .empty;
+        user.formatUser(&writer) catch return error.AuthenticationTooLong;
+        writer.writeByte(':') catch return error.AuthenticationTooLong;
+        password.formatPassword(&writer) catch return error.AuthenticationTooLong;
+    }
+
+    pub fn value(uri: Uri, out: []u8) (error{AuthenticationTooLong} || Writer.Error)![]u8 {
+        try validate(uri);
         var bw: Writer = .fixed(out);
-        write(uri, &bw) catch unreachable;
+        try write(uri, &bw);
         return bw.buffered();
     }
 
@@ -1457,9 +1513,9 @@ pub const basic_authorization = struct {
         var w: Writer = .fixed(&buf);
         const user: Uri.Component = uri.user orelse .empty;
         const password: Uri.Component = uri.password orelse .empty;
-        user.formatUser(&w) catch unreachable;
-        w.writeByte(':') catch unreachable;
-        password.formatPassword(&w) catch unreachable;
+        try user.formatUser(&w);
+        try w.writeByte(':');
+        try password.formatPassword(&w);
         try out.print("Basic {b64}", .{w.buffered()});
     }
 };
@@ -1583,7 +1639,7 @@ pub fn connectProxied(
 
 fn connectProxiedWithReuse(client: *Client, proxy: *Proxy, proxied_host: HostName, proxied_port: u16, reuse: bool) !*Connection {
     const io = client.io;
-    if (!proxy.supports_connect) return error.TunnelNotSupported;
+    if (!proxy.supportsConnect(io)) return error.TunnelNotSupported;
 
     if (reuse) if (try client.connection_pool.findConnection(io, .{
         .host = proxied_host,
@@ -1592,7 +1648,7 @@ fn connectProxiedWithReuse(client: *Client, proxy: *Proxy, proxied_host: HostNam
     })) |node| return node;
 
     var maybe_valid = false;
-    (tunnel: {
+    return (tunnel: {
         const connection = try client.connectTcpOptions(.{
             .host = proxy.host,
             .port = proxy.port,
@@ -1601,11 +1657,11 @@ fn connectProxiedWithReuse(client: *Client, proxy: *Proxy, proxied_host: HostNam
             .proxied_port = proxied_port,
             .reuse = reuse,
         });
-        errdefer {
-            connection.closing = true;
-            client.connection_pool.release(connection, io);
-        }
-
+        var auth_header: [1]http.Header = undefined;
+        const headers: []const http.Header = if (proxy.authorization) |authorization| h: {
+            auth_header[0] = .{ .name = "Proxy-Authorization", .value = authorization };
+            break :h &auth_header;
+        } else &.{};
         var req = client.request(.CONNECT, .{
             .scheme = "http",
             .host = .{ .raw = proxied_host.bytes },
@@ -1613,13 +1669,34 @@ fn connectProxiedWithReuse(client: *Client, proxy: *Proxy, proxied_host: HostNam
         }, .{
             .redirect_behavior = .unhandled,
             .connection = connection,
+            .extra_headers = headers,
         }) catch |err| {
+            connection.closing = true;
+            client.connection_pool.release(connection, io);
             break :tunnel err;
         };
-        defer req.deinit();
+        defer {
+            // Failed CONNECT bodies are untrusted and need not be drained.
+            // Their origin-keyed sockets must never look like working tunnels.
+            if (req.connection) |owned| owned.closing = true;
+            req.deinit();
+        }
 
-        req.sendBodiless() catch |err| break :tunnel err;
-        const response = req.receiveHead(&.{}) catch |err| break :tunnel err;
+        req.sendBodiless() catch |err| {
+            if (connection.stream_writer.err) |write_err| {
+                if (write_err == error.Canceled) return error.Canceled;
+            }
+            break :tunnel err;
+        };
+        const response = req.receiveHead(&.{}) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            if (err == error.ReadFailed) {
+                if (connection.getReadError()) |read_err| {
+                    if (read_err == error.Canceled) return error.Canceled;
+                }
+            }
+            break :tunnel err;
+        };
 
         if (response.head.status.class() == .server_error) {
             maybe_valid = true;
@@ -1634,10 +1711,12 @@ fn connectProxiedWithReuse(client: *Client, proxy: *Proxy, proxied_host: HostNam
 
         connection.closing = false;
 
-        return connection;
-    }) catch {
+        break :tunnel connection;
+    }) catch |err| {
+        // Cancellation must not disable CONNECT or start forwarding a GET.
+        if (err == error.Canceled) return error.Canceled;
         // something went wrong with the tunnel
-        proxy.supports_connect = maybe_valid;
+        proxy.setSupportsConnect(io, maybe_valid);
         return error.TunnelNotSupported;
     };
 }
@@ -1649,7 +1728,7 @@ fn connectHttpsProxy(client: *Client, proxy: *Proxy, host: HostName, port: u16, 
     // TLS-over-TLS needs a distinct layered transport; do not pretend that TLS
     // to the proxy authenticates or encrypts the connection to the origin.
     if (proxy.protocol != .plain) return error.HttpsProxyUnsupported;
-    if (!proxy.supports_connect) return error.ProxyTunnelRefused;
+    if (!proxy.supportsConnect(io)) return error.ProxyTunnelRefused;
     if (reuse) if (try client.connection_pool.findConnection(io, .{ .host = host, .port = port, .protocol = .tls })) |connection|
         return connection;
 
@@ -1771,7 +1850,7 @@ fn connectWithReuse(client: *Client, host: HostName, port: u16, protocol: Protoc
         return client.connectTcpOptions(.{ .host = host, .port = port, .protocol = protocol, .reuse = reuse });
     }
 
-    if (proxy.supports_connect) tunnel: {
+    if (proxy.supportsConnect(client.io)) tunnel: {
         return client.connectProxiedWithReuse(proxy, host, port, reuse) catch |err| switch (err) {
             error.TunnelNotSupported => break :tunnel,
             else => |e| return e,
@@ -1785,6 +1864,7 @@ fn connectWithReuse(client: *Client, host: HostName, port: u16, protocol: Protoc
 }
 
 pub const RequestError = ConnectTcpError || error{
+    AuthenticationTooLong,
     UnsupportedUriScheme,
     UriMissingHost,
     InvalidHostName,
@@ -1867,6 +1947,7 @@ pub fn request(
     }
 
     const protocol = Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
+    try basic_authorization.validate(uri);
 
     if (protocol == .tls) try client.ensureTls();
 
@@ -2015,6 +2096,36 @@ pub fn fetch(client: *Client, options: FetchOptions) FetchError!FetchResult {
 
 test {
     _ = Response;
+}
+
+test "overlong Basic credentials return errors without trapping" {
+    var url: [700]u8 = undefined;
+    const text = try std.fmt.bufPrint(&url, "http://{s}@localhost/", .{@as([600]u8, @splat('u'))});
+    const uri = try Uri.parse(text);
+    var writer: Writer = .fixed(&.{});
+    try testing.expectError(error.WriteFailed, basic_authorization.write(uri, &writer));
+    var authorization: [1024]u8 = undefined;
+    try testing.expectError(error.AuthenticationTooLong, basic_authorization.value(uri, &authorization));
+
+    var client: Client = .{ .allocator = testing.allocator, .io = Io.failing };
+    defer client.deinit();
+    // Reject before any connection or I/O can begin.
+    try testing.expectError(error.AuthenticationTooLong, client.request(.GET, uri, .{}));
+}
+
+test "Basic credential bounds preserve the combined 511-byte boundary" {
+    var authorization: [basic_authorization.max_value_len]u8 = undefined;
+    const valid: Uri = .{ .scheme = "http", .user = .{ .raw = &@as([510]u8, @splat('u')) } };
+    const encoded = try basic_authorization.value(valid, &authorization);
+    try testing.expectEqual(basic_authorization.max_value_len, encoded.len);
+
+    var invalid = valid;
+    invalid.password = .{ .raw = "p" };
+    try testing.expectError(error.AuthenticationTooLong, basic_authorization.validate(invalid));
+    // Validation counts URI formatting expansion as well as literal bytes.
+    invalid.user = .{ .raw = &@as([171]u8, @splat(' ')) };
+    invalid.password = null;
+    try testing.expectError(error.AuthenticationTooLong, basic_authorization.validate(invalid));
 }
 
 const HeadTestIo = struct {

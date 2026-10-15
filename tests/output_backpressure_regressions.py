@@ -98,10 +98,11 @@ def fixture(stall=True):
 class OutputBackpressureTests(unittest.TestCase):
     binary = None
 
-    def start(self, server, timeout='800ms', *extra):
+    def start(self, server, timeout='800ms', *extra, buffered=False):
         env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
         targets = [TARGET, STALLED_TARGET] if server.stall else [TARGET]
-        return subprocess.Popen([str(self.binary), '--no-progress', '--no-sort',
+        output_options = [] if buffered else ['--no-sort']
+        return subprocess.Popen([str(self.binary), '--no-progress', *output_options,
                                  '-T2', '-P1', '-H2', '--retries', '1', '--timeout', timeout,
                                  *extra, *targets], env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
@@ -168,6 +169,37 @@ class OutputBackpressureTests(unittest.TestCase):
             self.assertTrue(closed)
             self.assertEqual(proc.returncode, 1, stderr)
             self.assertIn(b'Error: WriteFailed', stderr)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX graceful SIGINT test')
+    def test_sigint_cancels_buffered_output_without_stdout_drain(self):
+        for extra in ((), ('--json',)):
+            with self.subTest(output=extra), fixture(stall=False) as server:
+                proc = self.start(server, '3s', *extra, buffered=True)
+                try:
+                    self.wait_for_output(proc, server)
+                    proc.send_signal(signal.SIGINT)
+                    proc.wait(timeout=3)
+                    stdout, stderr = proc.communicate(timeout=3)
+                finally:
+                    self.cleanup(proc)
+                self.assertEqual(proc.returncode, 1, stderr)
+                self.assertLess(len(stdout), sum(len(value) + 1 for value in IDS))
+                self.assertIn(b'Error: WriteFailed', stderr)
+
+    def test_buffered_output_broken_pipe_exits_with_write_failure(self):
+        for extra in ((), ('--json',)):
+            with self.subTest(output=extra), fixture(stall=False) as server:
+                proc = self.start(server, '3s', *extra, buffered=True)
+                try:
+                    self.wait_for_output(proc, server)
+                    proc.stdout.close()
+                    proc.stdout = None
+                    proc.wait(timeout=3)
+                    _, stderr = proc.communicate(timeout=3)
+                finally:
+                    self.cleanup(proc)
+                self.assertEqual(proc.returncode, 1, stderr)
+                self.assertIn(b'Error: WriteFailed', stderr)
 
     def test_normal_output_keeps_all_data_and_dedupe_order(self):
         with fixture(stall=False) as server:

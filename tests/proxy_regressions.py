@@ -173,6 +173,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         with self.server.lock:
             self.server.plaintext.append((self.path, dict(self.headers)))
+        if self.server.forward_http:
+            self.send_response(200)
+            self.send_header('Content-Length', '9')
+            self.end_headers()
+            self.wfile.write(b'forwarded')
+            self.wfile.flush()
+            return
         self.send_error(502)
 
     def do_CONNECT(self):
@@ -193,6 +200,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # socket instead of waiting for it or sending a plaintext GET.
             status = 407 if mode == 'auth' else 403
             self.connection.sendall(f'HTTP/1.1 {status} Rejected\r\nContent-Length: 100\r\n\r\n'.encode())
+            return
+        if mode == 'unavailable':
+            self.connection.sendall(b'HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n')
             return
         if mode == 'unexpected':
             self.connection.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\nplaintext')
@@ -249,11 +259,12 @@ def origin(tls=None, redirect=None):
 
 
 @contextlib.contextmanager
-def proxy(*origins, modes=None):
+def proxy(*origins, modes=None, forward_http=False):
     server = Server(ProxyHandler)
     server.ports = {item.server_port for item in origins}
     server.modes = modes or {}
     server.plaintext = []
+    server.forward_http = forward_http
     server.client_hellos = []
     server.connected = threading.Event()
     server.url = f'http://127.0.0.1:{server.server_port}'
@@ -330,6 +341,59 @@ class ProxyTests(unittest.TestCase):
                 self.assertEqual(headers.get('authorization'), origin_auth)
                 self.assertEqual(headers.get('x-frontend-id'), '6')
             self.assertEqual(tunnel.plaintext, [])
+
+    def test_plain_http_tunnel_authentication_and_reuse(self):
+        with origin() as plain, proxy(plain) as tunnel:
+            authenticated = tunnel.url.replace('://', '://proxy-user:proxy-secret@')
+            result = self.run_probe(authenticated, plain.url + '/one', plain.url + '/two')
+            self.assert_probe_ok(result, ['OK 200 6', 'OK 200 6'])
+            self.assertEqual(len(tunnel.requests), 1, tunnel.requests)
+            headers = {key.lower(): value for key, value in tunnel.requests[0][1].items()}
+            authorization = 'Basic ' + base64.b64encode(b'proxy-user:proxy-secret').decode()
+            self.assertEqual(headers.get('proxy-authorization'), authorization)
+            self.assertEqual(plain.requests[0][2], plain.requests[1][2])
+            for _, headers, _ in plain.requests:
+                self.assertNotIn('proxy-authorization', {key.lower() for key in headers})
+            self.assertEqual(tunnel.plaintext, [])
+
+    def test_overlong_proxy_credentials_fail_before_network_io(self):
+        with origin(self.certificates.contexts['valid']) as secure, proxy(secure) as tunnel:
+            credentials = 'u' * 600
+            authenticated = tunnel.url.replace('://', '://' + credentials + '@')
+            result = self.run_probe(authenticated, secure.url)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('AuthenticationTooLong', result.stderr)
+            result = self.run_cli(secure.url, authenticated)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('AuthenticationTooLong', result.stderr)
+            self.assertNotIn(credentials, result.stderr)
+            self.assertEqual(tunnel.requests, [])
+            self.assertEqual(secure.requests, [])
+
+    def test_plain_http_failed_connect_closes_before_forwarding(self):
+        for mode in ('refused', 'unavailable'):
+            with self.subTest(mode=mode), origin() as plain, \
+                    proxy(plain, modes={plain.server_port: mode}, forward_http=True) as tunnel:
+                started = time.monotonic()
+                result = self.run_probe(tunnel.url, plain.url + '/one', plain.url + '/two')
+                self.assertLess(time.monotonic() - started, 3)
+                self.assert_probe_ok(result, ['OK 200 9', 'OK 200 9'])
+                # A failed tunnel must never be leased as an established origin
+                # connection and receive an origin-form request on the next GET.
+                self.assertEqual([path for path, _ in tunnel.plaintext],
+                                 [plain.url + '/one', plain.url + '/two'])
+                self.assertEqual(plain.requests, [])
+
+    def test_plain_http_cancel_during_connect_does_not_forward(self):
+        with origin() as stalled, origin() as good, \
+                proxy(stalled, good, modes={stalled.server_port: 'stall_connect'},
+                      forward_http=True) as tunnel:
+            result = self.run_probe(tunnel.url, '^' + stalled.url, good.url)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertRegex(result.stdout, r'^EXPECTED_CANCEL (Canceled|ReadFailed)\nOK 200 6\n$')
+            self.assertEqual(len(tunnel.requests), 2)
+            self.assertEqual(tunnel.plaintext, [])
+            self.assertEqual(len(good.requests), 1)
 
     def test_certificate_rejections_release_failed_tunnels(self):
         for kind in ('untrusted', 'hostname', 'expired'):

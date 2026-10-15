@@ -46,7 +46,7 @@ fn run(init: std.process.Init, out: *Io.Writer) !bool {
         const host = try Io.net.HostName.fromUri(uri, &host_buffer);
         const authorization: ?[]const u8 = if (uri.user != null or uri.password != null) value: {
             const buffer = try arena.alloc(u8, Client.basic_authorization.valueLengthFromUri(uri));
-            break :value Client.basic_authorization.value(uri, buffer);
+            break :value try Client.basic_authorization.value(uri, buffer);
         } else null;
         proxy = .{
             .protocol = protocol,
