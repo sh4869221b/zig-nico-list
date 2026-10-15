@@ -6,8 +6,10 @@ const domain = @import("domain.zig");
 const scheduler = @import("scheduler.zig");
 const Io = std.Io;
 const version = "v0.03";
+var interrupted: std.atomic.Value(bool) = .init(false);
 
 fn interrupt(_: std.posix.SIG) callconv(.c) void {
+    interrupted.store(true, .release);
     domain.canceled.store(true, .release);
 }
 
@@ -196,9 +198,9 @@ const BufferedOutput = struct {
             const done = self.done;
             self.mutex.unlock(io);
             if (done) return future.await(io);
-            // A small result can still finish after HTTP/input cancellation.
-            // A blocked final write must remain interruptible as well.
-            if (domain.canceled.load(.acquire)) return future.cancel(io);
+            // Input failures stop fetching but preserve completed output.
+            // Only an external signal cancels a blocked final write.
+            if (interrupted.load(.acquire)) return future.cancel(io);
         }
     }
 };

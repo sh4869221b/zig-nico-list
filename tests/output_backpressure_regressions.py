@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import signal
+import select
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -98,20 +100,52 @@ def fixture(stall=True):
 class OutputBackpressureTests(unittest.TestCase):
     binary = None
 
-    def start(self, server, timeout='800ms', *extra, buffered=False):
+    def start(self, server, timeout='800ms', *extra, buffered=False, stdin=None):
         env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
         targets = [TARGET, STALLED_TARGET] if server.stall else [TARGET]
         output_options = [] if buffered else ['--no-sort']
         return subprocess.Popen([str(self.binary), '--no-progress', *output_options,
                                  '-T2', '-P1', '-H2', '--retries', '1', '--timeout', timeout,
                                  *extra, *targets], env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
+                                 stderr=subprocess.PIPE, stdin=stdin)
+
+    def start_after_input_error(self, server, path, *extra, source='file'):
+        # T=1 keeps the second target in the acknowledged input mailbox until
+        # the first target has completed. Only then can scanning reach the
+        # oversized line and stop the remaining work with an input error.
+        if source == 'file':
+            return self.start(server, '3s', '-T1', '--input-file', str(path),
+                              *extra, buffered=True)
+        with path.open('rb') as stream:
+            return self.start(server, '3s', '-T1', '--stdin', *extra,
+                              buffered=True, stdin=stream)
 
     def wait_for_output(self, proc, server):
         self.assertTrue(server.output_ready.wait(3), 'successful target did not finish')
         # Nothing reads stdout until the supervision assertion is captured.
         time.sleep(.1)
         self.assertIsNone(proc.poll(), 'large output should be backpressured')
+
+    def take_output_prefix(self, proc):
+        prefix = []
+        ready = threading.Event()
+
+        def read_one():
+            try:
+                # Read directly so communicate cannot skip prefetched bytes.
+                prefix.append(os.read(proc.stdout.fileno(), 1))
+            finally:
+                ready.set()
+
+        reader = threading.Thread(target=read_one, daemon=True)
+        reader.start()
+        if not ready.wait(3):
+            proc.kill()
+            reader.join(timeout=3)
+            self.fail('final output did not start')
+        reader.join()
+        self.assertEqual(len(prefix[0]), 1, 'final output ended without data')
+        return prefix[0]
 
     def cleanup(self, proc):
         if proc.poll() is None:
@@ -200,6 +234,64 @@ class OutputBackpressureTests(unittest.TestCase):
                     self.cleanup(proc)
                 self.assertEqual(proc.returncode, 1, stderr)
                 self.assertIn(b'Error: WriteFailed', stderr)
+
+    def test_input_error_keeps_completed_buffered_output_under_backpressure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'inputs.txt'
+            path.write_bytes(STALLED_TARGET.encode() + b'\n' + b'x' * (1024 * 1024) + b'\n')
+            expected = sorted(IDS + IDS[:2])
+            for source in ('file', 'stdin'):
+                for extra in ((), ('--json',)):
+                    with self.subTest(source=source, output=extra), fixture(stall=False) as server:
+                        proc = self.start_after_input_error(server, path, *extra, source=source)
+                        try:
+                            self.assertTrue(server.output_ready.wait(3))
+                            prefix = self.take_output_prefix(proc)
+                            # Keep stdout blocked longer than the final-output
+                            # supervisor's polling interval before draining it.
+                            with self.assertRaises(subprocess.TimeoutExpired):
+                                proc.wait(timeout=.2)
+                            stdout, stderr = proc.communicate(timeout=5)
+                            stdout = prefix + stdout
+                        finally:
+                            self.cleanup(proc)
+                        self.assertEqual(proc.returncode, 1, stderr)
+                        self.assertIn(b'Error: bufio.Scanner: token too long', stderr)
+                        self.assertNotIn(b'Error: WriteFailed', stderr)
+                        self.assertIn(f'output_count={len(expected)}'.encode(), stderr)
+                        if extra:
+                            output = json.loads(stdout)
+                            self.assertEqual(output['items'], expected)
+                            completed = next(item for item in output['targets'] if item['id'] == '1')
+                            self.assertEqual(completed['items'], IDS + IDS[:2])
+                        else:
+                            self.assertEqual(stdout, ''.join(value + '\n' for value in expected).encode())
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX graceful signal test')
+    def test_signal_still_cancels_final_output_after_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'inputs.txt'
+            path.write_bytes(STALLED_TARGET.encode() + b'\n' + b'x' * (1024 * 1024) + b'\n')
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                for extra in ((), ('--json',)):
+                    with self.subTest(signal=sig, output=extra), fixture(stall=False) as server:
+                        proc = self.start_after_input_error(server, path, *extra)
+                        try:
+                            self.assertTrue(server.output_ready.wait(3))
+                            # Final output starts only after the input error
+                            # has stopped the scheduler. Observe bytes without
+                            # draining the pipe before sending the real signal.
+                            self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                            with self.assertRaises(subprocess.TimeoutExpired):
+                                proc.wait(timeout=.1)
+                            proc.send_signal(sig)
+                            proc.wait(timeout=3)
+                            stdout, stderr = proc.communicate(timeout=3)
+                        finally:
+                            self.cleanup(proc)
+                        self.assertEqual(proc.returncode, 1, stderr)
+                        self.assertIn(b'Error: WriteFailed', stderr)
+                        self.assertLess(len(stdout), sum(len(value) + 1 for value in IDS))
 
     def test_normal_output_keeps_all_data_and_dedupe_order(self):
         with fixture(stall=False) as server:

@@ -72,6 +72,10 @@ After fetching finishes, sorted line output and JSON serialization plus their
 final flush run in one awaited output task with the same signal polling. A full
 stdout pipe therefore remains interruptible through the end of the command;
 failed final writes also discard retained writer bytes before cleanup.
+Final-output interruption watches a separate signal flag. Input-read errors stop
+fetching through the shared shutdown flag, but completed results are fully
+written before reporting that input error. SIGINT/SIGTERM can still interrupt
+the final write even after an input error has stopped fetching.
 
 Io.Future.cancel cancellation is consumed at the next cancellation point, and
 std.http may wrap it in ReadFailed. The owning Deadline therefore preserves the
