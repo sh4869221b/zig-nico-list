@@ -17,6 +17,8 @@ response representation, allocator boundaries, and sort pipeline are rebuilt.
   termination, task lifecycle, deadline supervision, target-completion events.
 - `domain.zig`: HTTP requests, retries, rate/admission policy, metrics, typed
   attempt-deadline ownership. It contains no target/page task graph.
+- `http_client.zig`: pinned Zig HTTP client with a narrow authenticated
+  CONNECT-to-origin-TLS repair and bounded stale-connection replay support; see [HTTPS proxy transport](HTTPS_PROXY.md).
 - `page.zig`: complete wire-schema definitions, validating token projection,
   selected-ID ownership and filters.
 - `id_order.zig`: borrowed sort-key decoration, ordering, scratch allocation.
@@ -63,8 +65,11 @@ std.http may wrap it in ReadFailed. The owning Deadline therefore preserves the
 reason independently of the transport error. Client timeout stays Timeout for
 adaptive overload feedback and is propagated as a terminal page failure. It is
 not retried inside the canceled page future: the supervisor is joining that
-future and cannot supervise a new attempt there. Other transport errors retain
-the configured attempt/backoff budget. Caller cancellation stays neutral.
+future and cannot supervise a new attempt there. A zero-byte response-head EOF on a reused socket can replay the GET once on a
+fresh connection within the original active deadline. Partial headers, responses,
+body failures and fresh-connection failures never enter this replay path. Other
+transport errors retain the configured attempt/backoff budget. Failed sends mark
+the connection closing before cleanup so later retries cannot reuse a broken socket. Caller cancellation stays neutral.
 A failed target retains its successfully committed page prefix, carries an
 error in JSON and diagnostics, and increments fetch_err. The default exit is
 nonzero; explicit --best-effort keeps its existing exit-code override. Error/404 response

@@ -1,4 +1,5 @@
 const std = @import("std");
+const HttpClient = @import("http_client.zig");
 const cli = @import("cli.zig");
 const page = @import("page.zig");
 const adaptive = @import("adaptive.zig");
@@ -49,6 +50,7 @@ pub const Metrics = struct {
     retry_http_429: u64 = 0,
     retry_http_5xx: u64 = 0,
     retry_transport: u64 = 0,
+    transport_replays: u64 = 0,
     acquire_ns: u64 = 0,
     send_ns: u64 = 0,
     head_ns: u64 = 0,
@@ -255,6 +257,10 @@ pub const Deadline = struct {
         if (self.expires.cmpxchgStrong(expires, -1, .acq_rel, .acquire) != null) return false;
         return true;
     }
+    fn requireActive(self: *const Deadline, timestamp: i64) !void {
+        if (self.aborted.load(.acquire)) return error.Canceled;
+        if (self.expires.load(.acquire) <= timestamp) return error.Timeout;
+    }
 };
 
 pub const Context = struct {
@@ -266,7 +272,7 @@ pub const Context = struct {
     io: Io,
     cfg: *const cli.Config,
     control: *Control,
-    client: *std.http.Client,
+    client: *HttpClient,
     /// One deadline per active HTTP attempt; the scheduler owns cancellation.
     deadline: ?*Deadline = null,
     target_sequence: usize = 0,
@@ -294,6 +300,8 @@ pub const AttemptTrace = struct {
     head_ns: i64 = 0,
     body_ns: i64 = 0,
     cleanup_ns: i64 = 0,
+    transport_replays: u8 = 0,
+    replay_cause: ?[]const u8 = null,
     phase: enum { acquire, send, head, body, complete } = .acquire,
     connection: enum { unknown, pool_miss, pool_hit } = .unknown,
     response_version: ?[]const u8 = null,
@@ -309,6 +317,36 @@ pub const AttemptTrace = struct {
 };
 const Attempt = struct { generation: u64, index: i64, retry_at: i64 = 0, trace: AttemptTrace = .{} };
 fn requestRaw(ctx: *Context, url: []const u8, attempt_info: *Attempt) anyerror!Response {
+    return requestOnce(ctx, url, attempt_info, false) catch |err| {
+        if (err != error.StalePooledConnection) return err;
+        // The supervisor can be joining this future after claiming its timer.
+        // Never start new I/O after that claim, even if a wrapper consumed the
+        // cancellation signal. The replay shares the original attempt deadline.
+        const deadline = ctx.deadline orelse return error.MissingDeadlineOwner;
+        try deadline.requireActive(now(ctx.io));
+        try check(ctx.io);
+        const trace = &attempt_info.trace;
+        const first = trace.*;
+        trace.acquire_ns = 0;
+        trace.send_ns = 0;
+        trace.head_ns = 0;
+        trace.body_ns = 0;
+        trace.cleanup_ns = 0;
+        trace.phase = .acquire;
+        trace.transport_replays = 1;
+        trace.replay_cause = "HttpConnectionClosing";
+        defer {
+            inline for (.{ "acquire_ns", "send_ns", "head_ns", "body_ns", "cleanup_ns" }) |field| {
+                @field(trace, field) += @field(first, field);
+            }
+            // This describes the initial lease; the one replay is always fresh.
+            trace.connection = first.connection;
+        }
+        return requestOnce(ctx, url, attempt_info, true);
+    };
+}
+
+fn requestOnce(ctx: *Context, url: []const u8, attempt_info: *Attempt, fresh: bool) anyerror!Response {
     const trace = &attempt_info.trace;
     var phase_started = now(ctx.io);
     defer switch (trace.phase) {
@@ -321,9 +359,9 @@ fn requestRaw(ctx: *Context, url: []const u8, attempt_info: *Attempt) anyerror!R
     const uri = try std.Uri.parse(url);
     // Use the same public pool operation as Client.connect for direct requests.
     // Proxies and redirected connections cannot be classified by this lookup.
-    var pooled: ?*std.http.Client.Connection = null;
-    if (ctx.cfg.http_metrics and ctx.client.http_proxy == null and ctx.client.https_proxy == null) {
-        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
+    var pooled: ?*HttpClient.Connection = null;
+    if (!fresh and ctx.cfg.http_metrics and ctx.client.http_proxy == null and ctx.client.https_proxy == null) {
+        const protocol = HttpClient.Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
         const host = try std.Io.net.HostName.fromUri(uri, &host_buffer);
         pooled = try ctx.client.connection_pool.findConnection(ctx.io, .{
@@ -335,6 +373,7 @@ fn requestRaw(ctx: *Context, url: []const u8, attempt_info: *Attempt) anyerror!R
     }
     var req = ctx.client.request(.GET, uri, .{
         .connection = pooled,
+        .force_new_connection = fresh,
         .headers = .{ .accept_encoding = .omit },
         .extra_headers = &.{ .{ .name = "X-Frontend-Id", .value = "6" }, .{ .name = "Accept", .value = "*/*" } },
         .redirect_behavior = .init(10),
@@ -355,7 +394,13 @@ fn requestRaw(ctx: *Context, url: []const u8, attempt_info: *Attempt) anyerror!R
     trace.phase = .head;
     phase_started = now(ctx.io);
     var redirect_buffer: [8192]u8 = undefined;
-    var res = try req.receiveHead(&redirect_buffer);
+    var res = req.receiveHead(&redirect_buffer) catch |err| {
+        // GET is replay-safe, but do not hide partial/invalid heads, status
+        // responses, body errors, redirects, fresh-connection EOF, or timeouts.
+        if (!fresh and err == error.HttpConnectionClosing and req.response_heads == 0 and req.connection.?.reused)
+            return error.StalePooledConnection;
+        return err;
+    };
     trace.head_ns = now(ctx.io) - phase_started;
     trace.status = @backingInt(res.head.status);
     trace.response_version = @tagName(res.head.version);
@@ -569,6 +614,7 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
         inline for (.{ "acquire_ns", "send_ns", "head_ns", "body_ns", "cleanup_ns" }) |field| {
             @field(c.metrics, field) +|= @intCast(@max(0, @field(trace, field)));
         }
+        c.metrics.transport_replays += trace.transport_replays;
         switch (trace.connection) {
             .pool_miss => c.metrics.pool_misses += 1,
             .pool_hit => c.metrics.pool_hits += 1,
@@ -646,7 +692,9 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
             // It cannot safely retry in the same future: another blocked attempt
             // would have no deadline supervisor while that join is in progress.
             // A client timeout is a failure, never successful caller cancellation.
-            if (err == error.Canceled or err == error.Timeout) return err;
+            if (err == error.Canceled or err == error.Timeout or
+                err == error.HttpsProxyUnsupported or err == error.ProxyTunnelRefused or
+                err == error.ProxyAuthenticationRequired or err == error.ProxyTunnelUnexpectedData) return err;
             last_error = err;
             status_error = 0;
         }
@@ -664,6 +712,7 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
 
 pub fn errorMessage(allocator: Allocator, err: anyerror) []const u8 {
     const name = @errorName(err);
+    if (err == error.HttpsProxyUnsupported) return "HTTPS proxy endpoints are unsupported; origin TLS requires an HTTP CONNECT proxy";
     if (std.mem.startsWith(u8, name, "Http")) return std.fmt.allocPrint(allocator, "unexpected status: {s}", .{name[4..]}) catch name;
     return name;
 }
@@ -761,4 +810,17 @@ test "deadline claims are attempt-specific and late completion is rejected" {
     aborted.start(100);
     aborted.cancel();
     try std.testing.expectEqual(Deadline.Outcome.canceled, aborted.complete(100, 99));
+}
+
+test "stale replay requires an active unclaimed attempt deadline" {
+    var deadline: Deadline = .{};
+    try std.testing.expectError(error.Timeout, deadline.requireActive(50));
+    deadline.start(100);
+    try deadline.requireActive(99);
+    try std.testing.expectError(error.Timeout, deadline.requireActive(100));
+    try std.testing.expect(deadline.cancelIfExpired(101));
+    try std.testing.expectError(error.Timeout, deadline.requireActive(101));
+    deadline.start(200);
+    deadline.cancel();
+    try std.testing.expectError(error.Canceled, deadline.requireActive(150));
 }

@@ -15,6 +15,7 @@ import unittest
 import urllib.parse
 
 import scheduler_regressions
+import stale_connection_regressions
 
 BINARY = str(Path(sys.argv.pop(1)).resolve()) if len(sys.argv) > 1 else str(Path('zig-out/bin/zig-nico-list').resolve())
 USER = 'https://www.nicovideo.jp/user/1'
@@ -286,13 +287,14 @@ class CliIntegration(unittest.TestCase):
                     self.assertEqual(result.returncode, 0 if recover else 1, result.stderr)
                     self.assertEqual(result.stdout, 'sm1\nsm2\n' if recover else 'sm1\n')
                     self.assertIn('fetch_ok=1 fetch_err=0' if recover else 'fetch_ok=0 fetch_err=1', result.stderr)
-                    self.assertEqual(server.requests, [1, 2, 2])
+                    self.assertEqual(server.requests, [1, 2, 2] if recover else [1, 2, 2, 2])
                     metrics = next(json.loads(line)['http']['metrics'] for line in result.stderr.splitlines()
                                    if line.startswith('{') and json.loads(line).get('msg') == 'http_metrics')
-                    self.assertEqual(metrics['attempts'], 3)
-                    self.assertEqual(metrics['retries'], 1)
+                    self.assertEqual(metrics['attempts'], 2 if recover else 3)
+                    self.assertEqual(metrics['retries'], 0 if recover else 1)
+                    self.assertEqual(metrics['transport_replays'], 1)
                     self.assertEqual(metrics['page_errors'], 0 if recover else 1)
-                    self.assertEqual(metrics['transport_errors'], 1 if recover else 2)
+                    self.assertEqual(metrics['transport_errors'], 0 if recover else 2)
 
     def test_other_http_status_is_counted_and_logged(self):
         for recover in (True, False):
@@ -392,18 +394,22 @@ class CliIntegration(unittest.TestCase):
             rows = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
             traces = [row['attempt'] for row in rows if row.get('msg') == 'http_attempt']
             metrics = next(row['http']['metrics'] for row in rows if row.get('msg') == 'http_metrics')
-            self.assertEqual([t['request_id'] for t in traces], [1, 2, 3, 4, 5, 6])
-            self.assertEqual([t['attempt'] for t in traces], [1, 2, 3, 4, 5, 6])
-            self.assertEqual([t['retry_cause'] for t in traces], ['none', 'http_403', 'http_other', 'http_5xx', 'http_429', 'transport'])
+            self.assertEqual([t['request_id'] for t in traces], [1, 2, 3, 4, 5])
+            self.assertEqual([t['attempt'] for t in traces], [1, 2, 3, 4, 5])
+            self.assertEqual([t['retry_cause'] for t in traces], ['none', 'http_403', 'http_other', 'http_5xx', 'http_429'])
             self.assertEqual({(t['target_sequence'], t['page']) for t in traces}, {(0, 1)})
             self.assertEqual(traces[-1]['response_version'], 'HTTP/1.1')
             self.assertEqual(traces[3]['throttle_decision']['reason'], 'http_429')
-            for cause in ('http_403', 'http_other', 'http_5xx', 'http_429', 'transport'):
+            for cause in ('http_403', 'http_other', 'http_5xx', 'http_429'):
                 self.assertEqual(metrics['retry_' + cause], 1)
-            self.assertEqual(metrics['retries'], 5)
+            self.assertEqual(metrics['retry_transport'], 0)
+            self.assertEqual(metrics['retries'], 4)
+            self.assertEqual(metrics['transport_replays'], 1)
+            self.assertEqual(traces[-1]['transport_replays'], 1)
+            self.assertEqual(server.requests, [1, 1, 1, 1, 1, 1])
             self.assertEqual(metrics['http_403'], 1)
             self.assertGreater(metrics['pool_hits'], 0)
-            self.assertEqual(sum(metrics[k] for k in ('pool_hits', 'pool_misses', 'pool_lookup_unknown')), 6)
+            self.assertEqual(sum(metrics[k] for k in ('pool_hits', 'pool_misses', 'pool_lookup_unknown')), 5)
             for trace in traces:
                 self.assertGreaterEqual(trace['duration_ns'], sum(trace[k] for k in
                     ('acquire_ns', 'send_ns', 'head_ns', 'body_ns', 'cleanup_ns')))
@@ -532,6 +538,11 @@ class CliIntegration(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
                 proc.communicate(timeout=5)
+
+
+def load_tests(loader, tests, pattern):
+    tests.addTests(stale_connection_regressions.suite(BINARY))
+    return tests
 
 
 if __name__ == '__main__':

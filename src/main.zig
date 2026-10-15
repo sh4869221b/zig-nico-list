@@ -1,4 +1,5 @@
 const std = @import("std");
+const HttpClient = @import("http_client.zig");
 const builtin = @import("builtin");
 const cli = @import("cli.zig");
 const domain = @import("domain.zig");
@@ -184,7 +185,7 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
         log_writer = &file_writer.interface;
     }
     var control = domain.Control.init(init.io, cfg);
-    var client: std.http.Client = .{ .allocator = init.gpa, .io = init.io };
+    var client: HttpClient = .{ .allocator = init.gpa, .io = init.io };
     defer client.deinit();
     try client.initDefaultProxies(a, init.environ_map);
     // Environment proxies must not intercept deterministic localhost fixtures.

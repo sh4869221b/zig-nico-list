@@ -3,6 +3,7 @@
 //! Each job owns its arena; ownership moves to its target after join. The
 //! scheduler is also the single deadline supervisor and the only result writer.
 const std = @import("std");
+const HttpClient = @import("http_client.zig");
 const cli = @import("cli.zig");
 const domain = @import("domain.zig");
 const Io = std.Io;
@@ -298,7 +299,7 @@ test "ordered commit ignores a later canceled page after an empty terminal page"
     const io = std.testing.io;
     const cfg: cli.Config = .{ .concurrency_pages = 4 };
     var control = domain.Control.init(io, &cfg);
-    var client: std.http.Client = .{ .allocator = a, .io = io };
+    var client: HttpClient = .{ .allocator = a, .io = io };
     defer client.deinit();
     var unused: u8 = 0;
     var engine = Scheduler.init(a, .{ .result_allocator = a, .temporary = a, .io = io, .cfg = &cfg, .control = &control, .client = &client }, .{ .context = &unused, .emit = struct {

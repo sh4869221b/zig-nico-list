@@ -45,6 +45,8 @@ On Windows, use `zig-out/bin/zig-nico-list.exe` in the final command. Python 3.1
 - Normal line output and the JSON schema follow the Go baseline. Diagnostic wording, timestamps, progress animation, and HTTP metrics field layout differ.
 - HTTP metrics count attempts separately from page-job outcomes. `http_other` covers response statuses outside 200, 404, 429 and 5xx; error-status attempts are logged with their numeric status. Client timeouts are reported as failed targets (nonzero exit unless `--best-effort`), retaining any successfully committed page prefix.
 - `--http-metrics` writes aggregate measurements and safe per-attempt JSON diagnostics. See [HTTP diagnostics](docs/HTTP_DIAGNOSTICS.md) for timing, retry, connection and adaptive-history semantics. Separate DNS/TCP/TLS/first-byte tracing and recent-window quantiles are not implemented.
+- A reused socket closed before any response can replay its GET once on a fresh connection within the original deadline, with separate transport-replay metrics.
+- HTTPS through HTTP CONNECT proxies establishes and verifies origin TLS. HTTPS-scheme proxy endpoints are explicitly unsupported; failed CONNECT never falls back to plaintext. See [HTTPS proxy security](docs/HTTPS_PROXY.md).
 - `NICO_BASE_URL` is a development/test override. The production default is `https://nvapi.nicovideo.jp/v3`.
 - Tests use deterministic localhost fixtures. CI does not make requests to the live niconico service and does not establish live-service compatibility or performance.
 - Graceful signal-driven cancellation is explicitly installed on POSIX Linux/macOS. Windows uses the platform's normal process termination behavior for console interrupts.

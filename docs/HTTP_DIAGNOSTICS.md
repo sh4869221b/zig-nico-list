@@ -177,3 +177,45 @@ PowerShell version and instrumentation when comparing runs. Retain the three
 new files together. Metrics are in the JSONL file, while the summary and final
 error are in the stderr file. Windows Ctrl+C uses normal process termination;
 the POSIX neutral SIGINT test is intentionally skipped on Windows.
+
+## Reused-socket EOF and bounded transport replay
+
+A loopback fault fixture reproduces a concrete slowdown mechanism: the server
+closes a previously successful keep-alive socket before sending the next response.
+Go's transport transparently replays that GET. Zig previously reported it as an
+application transport failure, waited 100 ms, and sent overload feedback to the
+adaptive controller. Repeating this fault reduced Zig's budget from 8 to 1.
+This establishes the local mechanism, not the cause of the historical Windows run.
+
+The client now permits one transport replay only when a reused connection ends
+with `HttpConnectionClosing` before any response head. The replay bypasses every
+connection-pool lookup and retains the same absolute attempt deadline. A claimed,
+expired or canceled deadline forbids it. No replay is added for fresh-connection
+EOF, partial/invalid headers, informational/redirect responses, HTTP error statuses,
+body/decode errors, TLS/authentication errors or timeouts. Those outcomes keep
+their existing retry policy. The adaptive algorithm is unchanged.
+
+`transport_replays` counts transport replay attempts started separately from
+application `attempts` and `retries`, both in the aggregate and per-attempt trace.
+It is not an exact wire-GET count: a fresh acquisition or send can itself fail. The replay
+trace has `replay_cause: "HttpConnectionClosing"`. Phase timings include both wire
+exchanges; `connection` still describes the initial lease, and the replay lease
+is always fresh. Only the final outcome is classified by the existing adaptive policy, with total
+service time including both exchanges. HTTP 403 remains neutral, HTTP 429 retains
+its cooldown behavior, and timeouts remain visible failures.
+
+## Failed sends must discard the socket
+
+A second loopback fixture sends a successful response and then resets the TCP
+connection while it is idle. A later write can fail before the HTTP reader moves
+out of its ready state. Previously `Request.deinit` could then return the broken
+socket to the pool, and every application retry selected it again without a new
+GET reaching the server. Four attempts reproduced failure after 0.73 seconds;
+the default ten-attempt schedule can add 51.1 seconds of backoff to such a page.
+
+`sendBodiless` now marks its connection closing on any failed send, including
+sends following redirects. The normal application retry/backoff rules still
+apply to write failures, but the next attempt can open a functioning connection.
+This repair does not expand the transparent replay criteria or classify a remote
+403 as a socket fault. Historical logs do not establish whether this mechanism
+occurred in the user's Windows runs.
