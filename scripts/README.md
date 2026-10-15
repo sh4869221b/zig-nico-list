@@ -1,7 +1,10 @@
 # CI and release helpers
 
-All helpers use Python's standard library (Python 3.12+). CI uses Python and
-GitHub CLI supplied by the hosted runner images and checksum-pinned Zig 0.17.0.
+The CI/release helpers use Python's standard library (Python 3.12+). The CLI
+integration suite additionally uses `cryptography`, pinned in
+`tests/requirements.txt`, to generate temporary loopback TLS certificates.
+CI uses Python and GitHub CLI supplied by the hosted runner images and
+checksum-pinned Zig 0.17.0.
 
 ## Workflow triggers and selected checks
 
@@ -87,6 +90,10 @@ at most four heavy jobs, with one compiler per runner. Both normal
   identity, settings, version, and binary bytes after integration. Normal CI
   also checks normalized packaging for the binary version, without uploading
   archives or creating a release.
+- Each executable job installs the pinned test dependency and builds the
+  isolated `tls-probe` helper before integration. TLS/proxy tests generate fresh
+  keys and certificates at runtime, use only loopback, and do not modify system
+  trust. Missing test prerequisites fail the job. The helper is not packaged.
 - Unit compilation uses its own ReleaseSafe/baseline cache. Test execution is
   marked `has_side_effects`, so every unit test runs even on a compilation hit.
   No build, test, integration, or identity-check command is skipped on hits.

@@ -536,6 +536,10 @@ pub const Response = struct {
                 else => return error.HttpHeadersInvalid,
             };
             if (first_line[8] != ' ') return error.HttpHeadersInvalid;
+            for (first_line[9..12]) |byte| {
+                if (!std.ascii.isDigit(byte)) return error.HttpHeadersInvalid;
+            }
+            if (first_line.len > 12 and first_line[12] != ' ') return error.HttpHeadersInvalid;
             const status: http.Status = @fromBackingInt(@intCast(parseInt3(first_line[9..12])));
             const reason = mem.trimStart(u8, first_line[12..], " ");
 
@@ -711,6 +715,17 @@ pub const Response = struct {
             try expectEqual(@as(u10, 0), parseInt3("000"));
             try expectEqual(@as(u10, 418), parseInt3("418"));
             try expectEqual(@as(u10, 999), parseInt3("999"));
+        }
+
+        test "status token requires exactly three decimal digits" {
+            for ([_][]const u8{ "1:0", "/00", "2A0", "20/", " 00", "200x" }) |status| {
+                var bytes: [32]u8 = undefined;
+                const response = try std.fmt.bufPrint(&bytes, "HTTP/1.1 {s} OK\r\n\r\n", .{status});
+                try testing.expectError(error.HttpHeadersInvalid, Head.parse(response));
+            }
+            for ([_][]const u8{ "HTTP/1.1 200\r\n\r\n", "HTTP/1.1 200 \r\n\r\n" }) |response| {
+                try testing.expectEqual(.ok, (try Head.parse(response)).status);
+            }
         }
 
         /// Help the programmer avoid bugs by calling this when the string
@@ -1104,6 +1119,8 @@ pub const Request = struct {
         /// passed directly to `Request.Head.parse`.
         HttpHeadersInvalid,
         TooManyHttpRedirects,
+        TooManyHttpInformationalResponses,
+        HttpProtocolSwitchUnsupported,
         /// This can be avoided by calling `receiveHead` before sending the
         /// request body.
         RedirectRequiresResend,
@@ -1140,7 +1157,17 @@ pub const Request = struct {
     /// If this fails with `error.ReadFailed` then the `Connection.getReadError`
     /// method of `r.connection` can be used to get more detailed information.
     pub fn receiveHead(r: *Request, redirect_buffer: []u8) ReceiveHeadError!Response {
+        // A head or redirect failure leaves framing uncertain. Do not drain a
+        // rejected response in deinit or make this connection reusable.
+        errdefer if (r.connection) |connection| {
+            connection.closing = true;
+        };
         var aux_buf = redirect_buffer;
+        // Bound each informational chain without reducing the existing limit
+        // for the final head. Redirects begin a new response chain.
+        const max_informational_heads = 16;
+        var informational_heads: usize = 0;
+        var informational_bytes: usize = 0;
         while (true) {
             // This while loop is for handling redirects, which means the request's
             // connection may be different than the previous iteration. However, it
@@ -1159,11 +1186,24 @@ pub const Request = struct {
             r.response_heads += 1;
             const head = &response.head;
 
-            if (head.status == .@"continue") {
-                if (r.handle_continue) continue;
-                r.response_transfer_encoding = head.transfer_encoding;
-                r.response_content_length = head.content_length;
-                return response; // we're not handling the 100-continue
+            if (head.status.class() == .informational) {
+                if (head.status == .switching_protocols) return error.HttpProtocolSwitchUnsupported;
+                if (informational_heads == max_informational_heads) return error.TooManyHttpInformationalResponses;
+                informational_heads += 1;
+                if (head_buffer.len > r.client.read_buffer_size - informational_bytes) return error.HttpHeadersOversize;
+                informational_bytes += head_buffer.len;
+                // Informational responses have no body, regardless of framing
+                // headers. Keep waiting within the caller's original deadline.
+                if (head.status == .@"continue" and !r.handle_continue) {
+                    r.response_transfer_encoding = .none;
+                    r.response_content_length = 0;
+                    // The final response is still pending. A caller that stops
+                    // after this head must not return the socket to the pool.
+                    connection.closing = true;
+                    return response;
+                }
+                r.reader.state = .ready;
+                continue;
             }
 
             if (r.method == .CONNECT and head.status.class() == .success) {
@@ -1176,12 +1216,12 @@ pub const Request = struct {
 
             connection.closing = !head.keep_alive or !r.keep_alive;
 
-            // Any response to a HEAD request and any response with a 1xx
-            // (Informational), 204 (No Content), or 304 (Not Modified) status
+            // Any response to a HEAD request and any response with a
+            // 204 (No Content) or 304 (Not Modified) status
             // code is always terminated by the first empty line after the
             // header fields, regardless of the header fields present in the
             // message.
-            if (r.method == .HEAD or head.status.class() == .informational or
+            if (r.method == .HEAD or
                 head.status == .no_content or head.status == .not_modified)
             {
                 r.response_transfer_encoding = head.transfer_encoding;
@@ -1191,15 +1231,12 @@ pub const Request = struct {
 
             if (head.status.class() == .redirect and r.redirect_behavior != .unhandled) {
                 if (r.redirect_behavior == .not_allowed) {
-                    // Connection can still be reused by skipping the body.
-                    const reader = r.reader.bodyReader(&.{}, head.transfer_encoding, head.content_length);
-                    _ = reader.discardRemaining() catch |err| switch (err) {
-                        error.ReadFailed => connection.closing = true,
-                    };
                     return error.TooManyHttpRedirects;
                 }
                 try r.redirect(head, &aux_buf);
                 try r.sendBodiless();
+                informational_heads = 0;
+                informational_bytes = 0;
                 continue;
             }
 
@@ -1224,14 +1261,6 @@ pub const Request = struct {
         if (new_location.len > aux_buf.*.len) return error.HttpRedirectLocationOversize;
         const location = aux_buf.*[0..new_location.len];
         @memcpy(location, new_location);
-        {
-            // Skip the body of the redirect response to leave the connection in
-            // the correct state. This causes `new_location` to be invalidated.
-            const reader = r.reader.bodyReader(&.{}, head.transfer_encoding, head.content_length);
-            _ = reader.discardRemaining() catch |err| switch (err) {
-                error.ReadFailed => return r.reader.body_err.?,
-            };
-        }
         const new_uri = r.uri.resolveInPlace(location.len, aux_buf) catch |err| switch (err) {
             error.UnexpectedCharacter => return error.HttpRedirectLocationInvalid,
             error.InvalidFormat => return error.HttpRedirectLocationInvalid,
@@ -1252,6 +1281,21 @@ pub const Request = struct {
         const keep_privileged_headers =
             std.ascii.eqlIgnoreCase(r.uri.scheme, new_uri.scheme) and
             old_host.sameParentDomain(new_host);
+        const redirect_to_get = switch (head.status) {
+            .see_other => true,
+            .moved_permanently, .found => r.method == .POST,
+            else => false,
+        };
+        if (r.transfer_encoding != .none and !redirect_to_get) return error.RedirectRequiresResend;
+
+        // Validate the redirect before waiting for its body. A rejected
+        // Location must preserve its own error even if the peer stalls.
+        {
+            const reader = r.reader.bodyReader(&.{}, head.transfer_encoding, head.content_length);
+            _ = reader.discardRemaining() catch |err| switch (err) {
+                error.ReadFailed => return r.reader.body_err orelse error.ReadFailed,
+            };
+        }
 
         r.client.connection_pool.release(old_connection, io);
         r.connection = null;
@@ -1261,22 +1305,11 @@ pub const Request = struct {
             r.privileged_headers = &.{};
         }
 
-        if (switch (head.status) {
-            .see_other => true,
-            .moved_permanently, .found => r.method == .POST,
-            else => false,
-        }) {
+        if (redirect_to_get) {
             // A redirect to a GET must change the method and remove the body.
             r.method = .GET;
             r.transfer_encoding = .none;
             r.headers.content_type = .omit;
-        }
-
-        if (r.transfer_encoding != .none) {
-            // The request body has already been sent. The request is
-            // still in a valid state, but the redirect must be handled
-            // manually.
-            return error.RedirectRequiresResend;
         }
 
         const new_connection = try r.client.connect(new_host, uriPort(new_uri, protocol), protocol);
@@ -1982,6 +2015,150 @@ pub fn fetch(client: *Client, options: FetchOptions) FetchError!FetchResult {
 
 test {
     _ = Response;
+}
+
+const HeadTestIo = struct {
+    remaining: []const u8,
+    reads: usize = 0,
+    closes: usize = 0,
+
+    fn repeat(comptime bytes: []const u8, comptime count: usize) [bytes.len * count]u8 {
+        var result: [bytes.len * count]u8 = undefined;
+        for (0..count) |index| @memcpy(result[index * bytes.len ..][0..bytes.len], bytes);
+        return result;
+    }
+
+    fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+        const self: *@This() = @ptrCast(@alignCast(userdata.?));
+        return switch (operation) {
+            .net_read => |read| blk: {
+                self.reads += 1;
+                // A rejected head must not read again to drain an absent body.
+                if (self.remaining.len == 0) break :blk .{ .net_read = error.ConnectionTimedOut };
+                var count: usize = 0;
+                for (read.data) |dest| {
+                    const len = @min(dest.len, self.remaining.len);
+                    @memcpy(dest[0..len], self.remaining[0..len]);
+                    self.remaining = self.remaining[len..];
+                    count += len;
+                }
+                break :blk .{ .net_read = .{ .data_len = count } };
+            },
+            else => unreachable,
+        };
+    }
+
+    fn close(userdata: ?*anyopaque, sockets: []const Io.net.Socket) void {
+        const self: *@This() = @ptrCast(@alignCast(userdata.?));
+        self.closes += sockets.len;
+    }
+
+    fn request(client: *Client, options: RequestOptions) !Request {
+        const stream: Io.net.Stream = .{
+            .socket = .{
+                .handle = if (builtin.os.tag == .windows) @ptrFromInt(1) else 1,
+                .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 80 } },
+            },
+        };
+        const plain = try Connection.Plain.create(client, .{ .bytes = "localhost" }, 80, stream);
+        try client.connection_pool.addUsed(client.io, &plain.connection);
+        var request_options = options;
+        request_options.connection = &plain.connection;
+        return client.request(.GET, try Uri.parse("http://localhost/"), request_options);
+    }
+};
+
+test "rejected response heads close without draining or pooling" {
+    const Case = struct {
+        bytes: []const u8,
+        expected: anyerror,
+        redirect_behavior: Request.RedirectBehavior = .init(1),
+        redirect_buffer_len: usize = 256,
+        reads: usize = 1,
+    };
+    for ([_]Case{
+        .{ .bytes = "HTTP/1.1 1:0 OK\r\n\r\n", .expected = error.HttpHeadersInvalid },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n", .expected = error.HttpHeadersInvalid },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Encoding: unknown\r\n\r\n", .expected = error.HttpHeadersInvalid },
+        .{ .bytes = "HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\nContent-Length: 1000\r\n\r\n", .expected = error.HttpContentEncodingUnsupported },
+        .{ .bytes = "HTTP/1.1 302 Found\r\n\r\n", .expected = error.HttpRedirectLocationMissing },
+        .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: /too-long\r\n\r\n", .expected = error.HttpRedirectLocationOversize, .redirect_buffer_len = 1 },
+        .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: //localhost:invalid/\r\n\r\n", .expected = error.HttpRedirectLocationInvalid },
+        .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: ftp://localhost/\r\n\r\n", .expected = error.UnsupportedUriScheme },
+        .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: /next\r\n\r\n", .expected = error.TooManyHttpRedirects, .redirect_behavior = .not_allowed },
+        .{ .bytes = "HTTP/1.1 101 Switching Protocols\r\n\r\n", .expected = error.HttpProtocolSwitchUnsupported },
+        .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: /next\r\n\r\n", .expected = error.ReadFailed, .reads = 2 },
+        .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 1000\r\n\r\n", .expected = error.ReadFailed, .reads = 2 },
+    }) |case| {
+        var backend: HeadTestIo = .{ .remaining = case.bytes };
+        var vtable = Io.failing.vtable.*;
+        vtable.operate = HeadTestIo.operate;
+        vtable.netClose = HeadTestIo.close;
+        const io: Io = .{ .userdata = &backend, .vtable = &vtable };
+        var client: Client = .{ .allocator = testing.allocator, .io = io };
+        defer client.deinit();
+        var req = try HeadTestIo.request(&client, .{ .redirect_behavior = case.redirect_behavior });
+        var redirect_buffer: [256]u8 = undefined;
+        try testing.expectError(case.expected, req.receiveHead(redirect_buffer[0..case.redirect_buffer_len]));
+        try testing.expect(req.connection.?.closing);
+        try testing.expectEqual(case.reads, backend.reads);
+        req.deinit();
+        try testing.expectEqual(case.reads, backend.reads);
+        try testing.expectEqual(@as(usize, 1), backend.closes);
+        try testing.expectEqual(@as(usize, 0), client.connection_pool.free_len);
+    }
+}
+
+test "informational responses wait for the final head with bounded input" {
+    const informational = "HTTP/1.1 103 Early Hints\r\n\r\n";
+    const final = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    const padded = "HTTP/1.1 102 Processing\r\nX-Pad: " ++ @as([600]u8, @splat('x')) ++ "\r\n\r\n";
+    const Case = struct { bytes: []const u8, expected: ?anyerror = null, heads: usize };
+    for ([_]Case{
+        .{ .bytes = "HTTP/1.1 100 Continue\r\n\r\n" ++ "HTTP/1.1 102 Processing\r\n\r\n" ++ informational ++ final, .heads = 4 },
+        .{ .bytes = HeadTestIo.repeat(informational, 16) ++ final, .heads = 17 },
+        .{ .bytes = HeadTestIo.repeat(informational, 17) ++ final, .expected = error.TooManyHttpInformationalResponses, .heads = 17 },
+        .{ .bytes = HeadTestIo.repeat(padded, 14) ++ final, .expected = error.HttpHeadersOversize, .heads = 13 },
+    }) |case| {
+        var backend: HeadTestIo = .{ .remaining = case.bytes };
+        var vtable = Io.failing.vtable.*;
+        vtable.operate = HeadTestIo.operate;
+        vtable.netClose = HeadTestIo.close;
+        const io: Io = .{ .userdata = &backend, .vtable = &vtable };
+        var client: Client = .{ .allocator = testing.allocator, .io = io };
+        defer client.deinit();
+        var req = try HeadTestIo.request(&client, .{});
+        if (case.expected) |expected| {
+            try testing.expectError(expected, req.receiveHead(&.{}));
+            try testing.expect(req.connection.?.closing);
+        } else {
+            const response = try req.receiveHead(&.{});
+            try testing.expectEqual(.ok, response.head.status);
+        }
+        try testing.expectEqual(case.heads, req.response_heads);
+        const reads = backend.reads;
+        req.deinit();
+        try testing.expectEqual(reads, backend.reads);
+        try testing.expectEqual(@as(usize, if (case.expected != null) 1 else 0), backend.closes);
+        try testing.expectEqual(@as(usize, if (case.expected != null) 0 else 1), client.connection_pool.free_len);
+    }
+}
+
+test "an exposed 100 Continue does not drain or pool a pending final response" {
+    var backend: HeadTestIo = .{ .remaining = "HTTP/1.1 100 Continue\r\n\r\n" };
+    var vtable = Io.failing.vtable.*;
+    vtable.operate = HeadTestIo.operate;
+    vtable.netClose = HeadTestIo.close;
+    const io: Io = .{ .userdata = &backend, .vtable = &vtable };
+    var client: Client = .{ .allocator = testing.allocator, .io = io };
+    defer client.deinit();
+    var req = try HeadTestIo.request(&client, .{ .handle_continue = false });
+    const response = try req.receiveHead(&.{});
+    try testing.expectEqual(.@"continue", response.head.status);
+    req.deinit();
+    try testing.expectEqual(@as(usize, 1), backend.reads);
+    try testing.expectEqual(@as(usize, 1), backend.closes);
+    try testing.expectEqual(@as(usize, 0), client.connection_pool.free_len);
 }
 
 test "failed bodiless sends discard pooled connections while reader is ready" {

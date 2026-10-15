@@ -58,20 +58,34 @@ nonzero unless the caller explicitly selected `--best-effort`.
 
 ## Verification and maintenance
 
-This publication excludes the TLS/proxy regression fixture because it contains a
-fixed test private key. Its integration-suite registration is also omitted.
-Restoring that coverage without stored private keys is tracked in
-[issue #13](https://github.com/sh4869221b/zig-nico-list/issues/13).
+The normal integration suite includes `tests/proxy_regressions.py`. It generates
+fresh CA and leaf keys and certificates in a temporary directory using the pinned
+`cryptography` development dependency. No private keys or certificate fixtures
+are stored in the repository. Servers listen only on loopback, and temporary
+files and sockets are removed after the suite.
 
-The normal formatting, ReleaseSafe unit, Python helper and CLI integration checks
-remain available. The independent stale-connection regressions still run in the
-integration suite. The optional `tls-probe` helper contains no key and remains
-buildable, but the excluded fixture tests do not run in this publication.
+The fixture-only `tls-probe` trusts only the generated test CA. The production
+CLI and OS trust store are unchanged. The suite checks trusted TLS, untrusted,
+wrong-host and expired certificates, direct HTTP/HTTPS, CONNECT rejection and
+cleanup, tunnel reuse, proxy credential separation, redirects, and cancellation
+and deadlines during tunnel establishment. The stale-connection suite runs
+alongside these checks.
 
-Earlier full-tree results (83 unit, 58 integration including trusted TLS/proxy
-cases, and 108 Python helper tests) apply to the complete local source before
-this publication-only exclusion. They are not final validation of this reduced
-tree. Its normal CI cannot replace the missing TLS/proxy regression coverage.
+Install the test dependency and build both the CLI and helper before running the
+integration suite, on Linux or Windows:
+
+```sh
+python -m pip install -r tests/requirements.txt
+zig build -Doptimize=fast -Dcpu=baseline
+zig build tls-probe -Doptimize=fast -Dcpu=baseline
+python tests/integration.py zig-out/bin/zig-nico-list
+```
+
+Use `zig-out/bin/zig-nico-list.exe` on Windows; the helper is resolved beside it
+as `tls-probe.exe`. Missing dependencies or the helper fail the suite. Native
+normal/release CI and the manual cold-build workflow prepare both before running
+integration. Earlier results from the previously excluded fixture are historical
+and do not establish validation of the current source.
 
 On a resource-limited Linux development host, the equivalent root module can
 be compiled directly, avoiding the build runner and LLVM memory overhead:

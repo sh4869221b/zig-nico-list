@@ -25,10 +25,12 @@ Zig 0.17.0を使用します。
 ```sh
 zig build -Doptimize=fast -Dcpu=baseline
 zig build test -Doptimize=safe
+python -m pip install -r tests/requirements.txt
+zig build tls-probe -Doptimize=fast -Dcpu=baseline
 python tests/integration.py zig-out/bin/zig-nico-list
 ```
 
-Windowsのテスト実行時は末尾を `zig-nico-list.exe` にします。
+Windowsのテスト実行時は末尾を `zig-nico-list.exe` にします。TLS・プロキシ回帰テストは開発用依存 `cryptography` で一時的な証明書と鍵を生成します。鍵をリポジトリへ保存せず、OSの信頼ストアも変更しません。`tls-probe` はテスト専用で、配布実行ファイルには含めません。
 
 CIはWindows/Linuxのネイティブ環境でユニット・ローカルHTTP統合テストを実行します。実サービスへアクセスするテストではありません。ログ文面、時刻表示、進捗表示、HTTPメトリクスの詳細形式はGo版と異なります。Windowsのコンソール割り込みは通常のOS終了動作を使用します。
 

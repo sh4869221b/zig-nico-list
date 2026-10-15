@@ -47,6 +47,12 @@ jobs:
       - name: Compare two cold native ReleaseFast baseline builds
         # Each build gets separate empty local AND global compiler caches.
         run: python scripts/check_build.py
+      - name: Install TLS fixture dependencies
+        run: python -m pip install --disable-pip-version-check -r tests/requirements.txt
+      - name: Build the isolated TLS fixture client
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache/tls-probe
+        run: zig build tls-probe -Doptimize=fast -Dcpu=baseline --cache-dir .zig-cache/tls-probe
       - name: Run integration on the cold-verified executable
         shell: bash
         env:

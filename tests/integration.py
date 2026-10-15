@@ -16,6 +16,10 @@ import urllib.parse
 
 import scheduler_regressions
 import stale_connection_regressions
+import http_head_regressions
+import rate_limit_regressions
+import output_backpressure_regressions
+import proxy_regressions
 
 BINARY = str(Path(sys.argv.pop(1)).resolve()) if len(sys.argv) > 1 else str(Path('zig-out/bin/zig-nico-list').resolve())
 USER = 'https://www.nicovideo.jp/user/1'
@@ -542,6 +546,10 @@ class CliIntegration(unittest.TestCase):
 
 def load_tests(loader, tests, pattern):
     tests.addTests(stale_connection_regressions.suite(BINARY))
+    tests.addTests(http_head_regressions.suite(BINARY))
+    tests.addTests(rate_limit_regressions.suite(BINARY))
+    tests.addTests(output_backpressure_regressions.suite(BINARY))
+    tests.addTests(proxy_regressions.suite(BINARY))
     return tests
 
 

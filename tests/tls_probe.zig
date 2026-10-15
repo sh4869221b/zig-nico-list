@@ -3,6 +3,8 @@
 //! Usage: tls-probe CA_PEM PROXY_URL_OR_DASH URL [URL...]
 //! Prefix a URL with ! to require a transport failure and then continue using
 //! the same client, allowing the fixture suite to check failed-tunnel cleanup.
+//! Prefix a URL with ^ to cancel blocked I/O after one second and then continue
+//! with the same client. This exercises native cancellation on both platforms.
 const std = @import("std");
 const Client = @import("http_client");
 const Io = std.Io;
@@ -58,6 +60,17 @@ fn run(init: std.process.Init, out: *Io.Writer) !bool {
     }
 
     for (args[3..]) |argument| {
+        if (std.mem.startsWith(u8, argument, "^")) {
+            var pending = try Io.concurrent(init.io, fetch, .{ &client, argument[1..] });
+            defer _ = pending.cancel(init.io) catch {};
+            try Io.sleep(init.io, .fromSeconds(1), .awake);
+            _ = pending.cancel(init.io) catch |err| {
+                if (client.connection_pool.used.first != null) return error.LeakedUsedConnection;
+                try out.print("EXPECTED_CANCEL {s}\n", .{@errorName(err)});
+                continue;
+            };
+            return error.ExpectedCancellationFailure;
+        }
         const expect_error = std.mem.startsWith(u8, argument, "!");
         const url = if (expect_error) argument[1..] else argument;
         const result = fetch(&client, url) catch |err| {

@@ -133,6 +133,10 @@ zig build test -Doptimize=safe
 if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed' }
 zig build -Doptimize=fast -Dcpu=baseline
 if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+python -m pip install -r tests/requirements.txt
+if ($LASTEXITCODE -ne 0) { throw 'Test dependency installation failed' }
+zig build tls-probe -Doptimize=fast -Dcpu=baseline
+if ($LASTEXITCODE -ne 0) { throw 'TLS fixture client build failed' }
 python tests/integration.py .\zig-out\bin\zig-nico-list.exe
 if ($LASTEXITCODE -ne 0) { throw 'Integration tests failed' }
 
@@ -225,3 +229,42 @@ apply to write failures, but the next attempt can open a functioning connection.
 This repair does not expand the transparent replay criteria or classify a remote
 403 as a socket fault. Historical logs do not establish whether this mechanism
 occurred in the user's Windows runs.
+
+## Rejected headers and informational responses
+
+Failed header parsing, unsupported response encoding, invalid/missing redirect
+locations, and other unrecoverable head errors mark the connection closing
+before cleanup. Invalid redirect destinations are checked before reading a
+redirect body. A peer that withholds a rejected response's body therefore cannot
+turn the original error into a cleanup-induced timeout or return that socket to
+the pool. Normal transport retry/backoff and successful redirect-body handling
+remain in effect.
+
+Status codes must contain three decimal digits. Informational responses such as
+102 and 103 are followed by the final response within the same attempt deadline.
+The client rejects protocol switching (101), more than 16 informational heads,
+or informational headers whose combined bytes exceed the configured head-buffer
+size. The final head retains its normal individual size limit; redirects start
+a new informational chain. An EOF after an informational head is not eligible
+for stale-socket replay. Loopback regressions cover malformed responses, stalled
+rejected bodies, normal retry recovery, informational chains and their bounds,
+and EOF/deadline failures before the final response.
+
+## Rate conversion and stdout backpressure
+
+Positive finite `--rate-limit` values whose interval cannot fit in an `i64`
+saturate to the maximum nanosecond interval before integer conversion. The next
+admission timestamp also saturates. The first request remains immediately
+eligible; later admission keeps waiting and remains cancelable. Unit tests cover
+adjacent floating-point boundary values, and the loopback suite checks ordinary
+pacing plus tiny/subnormal values without sending an unintended second request.
+
+During an output event, one sink task owns stdout while the coordinator continues
+to supervise page-job deadlines and cancellation. Admission pauses until that
+event completes, bounding retained output memory without an output queue. A
+blocked stdout pipe cannot extend another request's absolute deadline. SIGINT
+can cancel blocked output; an interrupted/failed output write remains an output
+error. The sink does not hold the logging mutex while writing stdout and does
+not retry buffered output after a write failure. Regressions check peer socket
+closure before stdout is drained, interrupted output, a broken pipe, and complete
+ordinary output.

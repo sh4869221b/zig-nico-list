@@ -126,8 +126,14 @@ pub const Control = struct {
     pub fn init(io: Io, cfg: *const cli.Config) Control {
         var interval = cfg.min_interval_ns;
         if (cfg.rate_limit > 0 and std.math.isFinite(cfg.rate_limit)) {
-            const n = @min(@as(f64, @floatFromInt(std.math.maxInt(i64))), 1e9 / cfg.rate_limit);
-            interval = @max(interval, @max(1, @as(i64, @intFromFloat(n))));
+            const n = 1e9 / cfg.rate_limit;
+            // The f64 representation of maxInt(i64) rounds up to 2^63.
+            // Saturate before conversion, including when division overflows.
+            const rate_interval = if (n >= @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                std.math.maxInt(i64)
+            else
+                @max(1, @as(i64, @intFromFloat(n)));
+            interval = @max(interval, rate_interval);
         }
         const ts = now(io);
         return .{ .io = io, .cfg = cfg, .interval = interval, .controller = .init(@intCast(cfg.concurrency_http), ts), .started = ts };
@@ -720,6 +726,35 @@ test "HTTP Retry-After IMF date" {
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sun, 06 Nov 1994 08:49:37 GMT"));
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sunday, 06-Nov-94 08:49:37 GMT"));
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sun Nov  6 08:49:37 1994"));
+}
+
+test "rate-limit interval conversion saturates before the i64 boundary" {
+    const Case = struct { rate: f64, interval: i64 };
+    const cases = [_]Case{
+        .{ .rate = 2, .interval = 500_000_000 },
+        .{ .rate = 1e12, .interval = 1 },
+        .{ .rate = 1e-10, .interval = std.math.maxInt(i64) },
+        .{ .rate = 5e-324, .interval = std.math.maxInt(i64) },
+        // Adjacent f64 rates around 1e9 / 2^63 exercise both conversion paths.
+        .{ .rate = 0x1.dcd6500000001p-34, .interval = 9_223_372_036_854_774_784 },
+        .{ .rate = 0x1.dcd6500000000p-34, .interval = std.math.maxInt(i64) },
+        .{ .rate = 0x1.dcd64ffffffffp-34, .interval = std.math.maxInt(i64) },
+    };
+    for (cases) |case| {
+        const cfg: cli.Config = .{ .rate_limit = case.rate };
+        const control = Control.init(std.testing.io, &cfg);
+        try std.testing.expectEqual(case.interval, control.interval);
+    }
+    const cfg: cli.Config = .{ .rate_limit = 4, .min_interval_ns = 500_000_000 };
+    const control = Control.init(std.testing.io, &cfg);
+    try std.testing.expectEqual(@as(i64, 500_000_000), control.interval);
+}
+
+test "saturated rate interval also saturates the next admission timestamp" {
+    const cfg: cli.Config = .{ .rate_limit = 1e-10 };
+    var control = Control.init(std.testing.io, &cfg);
+    _ = try control.rateWait(0);
+    try std.testing.expectEqual(std.math.maxInt(i64), control.rate_next);
 }
 
 test "Control APIs preserve independent fixed and adaptive budgets" {

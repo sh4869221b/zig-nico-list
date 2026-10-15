@@ -59,7 +59,7 @@ jobs:
       - name: Install checksum-pinned Zig 0.17.0
         run: python scripts/install_zig.py
       - name: Check Zig formatting
-        run: zig fmt --check build.zig src
+        run: zig fmt --check build.zig src tests/tls_probe.zig
 
   docs:
     name: Documentation sanity
