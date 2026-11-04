@@ -47,6 +47,8 @@ that threads never exceed H. Explicit H=0 remains unlimited HTTP admission.
 Automatic layer overrides, known-total page bounds, sequential unknown totals,
 and natural empty/404 termination remain intact. Already active work drains
 when an adaptive budget shrinks.
+Retry/cooldown readiness is checked before HTTP admission; the rate wait after
+admission only reserves the next pacing slot and checks cancellation.
 
 The scheduler assembles page results in page-number order even when they finish
 out of order. The earliest terminal page determines the valid prefix. A later
