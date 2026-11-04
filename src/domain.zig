@@ -211,14 +211,14 @@ pub const Control = struct {
         self.reserved -= 1;
         self.changed.broadcast(self.io);
     }
-    fn rateWait(self: *Control, delay: i64) !i64 {
-        if (self.interval <= 0 and delay <= 0) {
+    fn rateWait(self: *Control) !i64 {
+        if (self.interval <= 0) {
             try check(self.io);
             return 0;
         }
         const started = now(self.io);
         self.mutex.lockUncancelable(self.io);
-        const ready = @max(started +| delay, self.rate_next);
+        const ready = @max(started, self.rate_next);
         self.rate_next = ready +| self.interval;
         self.mutex.unlock(self.io);
         try sleep(self.io, ready - started);
@@ -560,7 +560,7 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
         c.mutex.lockUncancelable(ctx.io);
         const pause_epoch = c.pause_epoch;
         c.mutex.unlock(ctx.io);
-        const rate_wait = c.rateWait(0) catch |err| {
+        const rate_wait = c.rateWait() catch |err| {
             c.release();
             return err;
         };
@@ -754,7 +754,7 @@ test "rate-limit interval conversion saturates before the i64 boundary" {
 test "saturated rate interval also saturates the next admission timestamp" {
     const cfg: cli.Config = .{ .rate_limit = 1e-10 };
     var control = Control.init(std.testing.io, &cfg);
-    _ = try control.rateWait(0);
+    _ = try control.rateWait();
     try std.testing.expectEqual(std.math.maxInt(i64), control.rate_next);
 }
 
