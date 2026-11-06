@@ -146,7 +146,11 @@ including slots beyond a temporarily shortened slice; [] and null reset them.
 The previous port differed on two documented cases. These are fixes toward the
 original contract, not deleted features.
 
-The HTTP response itself is still fully buffered. "Token projection" refers to
+Successful HTTP response bodies are buffered up to 8 MiB, inclusive, independent
+of Content-Length or framing. Larger bodies fail with ResponseBodyTooLarge
+without decoding, retrying, or draining the remaining body; earlier committed
+pages remain available through the existing partial-result contract.
+The HTTP response itself is still fully buffered within that limit. "Token projection" refers to
 parsing that buffer without full schema/DOM materialization; it is not claimed
 to stream raw network bytes directly into the final output.
 

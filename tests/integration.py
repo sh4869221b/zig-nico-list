@@ -516,6 +516,50 @@ class CliIntegration(unittest.TestCase):
         with fixture(lambda *_: (200, body(('sm1',)), {'Content-Length': None, 'Connection': 'close'}, False)) as server:
             self.check_ok(command(server, '-P2', USER), 'sm1\n')
 
+    def test_response_body_size_boundary(self):
+        limit = 8 * 1024 * 1024
+        valid = body(('sm1',), total=1)
+        for framing in ('length', 'close', 'chunked', 'unfinished'):
+            for extra in ((1,) if framing == 'unfinished' else (0, 1)):
+                payload = valid + b' ' * (limit + extra - len(valid))
+                headers = {}
+                if framing == 'close':
+                    headers = {'Content-Length': None, 'Connection': 'close'}
+                elif framing == 'unfinished':
+                    # No length, terminator or EOF: reject at the limit without
+                    # waiting for the server to finish or the request timeout.
+                    headers = {'Content-Length': None}
+                elif framing == 'chunked':
+                    headers = {'Transfer-Encoding': 'chunked'}
+                    payload = f'{len(payload):x}\r\n'.encode() + payload + b'\r\n0\r\n\r\n'
+                with self.subTest(framing=framing, extra=extra), fixture(
+                        lambda *_: (200, payload, headers, False)) as server:
+                    result = command(server, '-P2', '--timeout', '10s', '--http-metrics', USER)
+                    self.assertEqual(result.returncode, extra, result.stderr)
+                    self.assertEqual(result.stdout, '' if extra else 'sm1\n')
+                    self.assertEqual(server.requests, [1])
+                    if extra:
+                        self.assertIn('ResponseBodyTooLarge', result.stderr)
+                        rows = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+                        metrics = next(row['http']['metrics'] for row in rows if row.get('msg') == 'http_metrics')
+                        self.assertEqual(metrics['body_errors'], 1)
+                        self.assertEqual(metrics['decode_errors'], 0)
+                        self.assertEqual(metrics['retries'], 0)
+
+    def test_oversized_later_body_retains_successful_prefix(self):
+        def reply(page, *_):
+            payload = body((f'sm{page}',), total=200)
+            if page == 2:
+                payload += b' ' * (8 * 1024 * 1024 + 1 - len(payload))
+            return 200, payload, {}, False
+        with fixture(reply) as server:
+            result = command(server, '-P2', '--timeout', '10s', '--json', USER)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output['items'], ['sm1'])
+            self.assertEqual(output['targets'][0]['error'], 'ResponseBodyTooLarge')
+            self.assertEqual(server.requests, [1, 2])
+
     def test_logfile_keeps_stdout_clean(self):
         with fixture() as server, tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'run.log'
