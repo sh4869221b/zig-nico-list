@@ -7,6 +7,9 @@ const date_time = @import("date_time.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+// Bound buffering independently of Content-Length and HTTP framing.
+const max_page_body_bytes = 8 * 1024 * 1024;
+
 pub var canceled: std.atomic.Value(bool) = .init(false);
 pub fn now(io: Io) i64 {
     return @intCast(Io.Timestamp.now(io, .awake).toNanoseconds());
@@ -444,7 +447,15 @@ fn requestOnce(ctx: *Context, url: []const u8, attempt_info: *Attempt, fresh: bo
     trace.phase = .body;
     phase_started = now(ctx.io);
     var transfer: [16384]u8 = undefined;
-    const body = res.reader(&transfer).allocRemaining(ctx.temporary, .unlimited) catch |err| return .{ .status = status, .body = try ctx.temporary.alloc(u8, 0), .body_error = err };
+    const body = res.reader(&transfer).allocRemaining(ctx.temporary, .limited(max_page_body_bytes)) catch |err| {
+        // Never drain or reuse a response rejected before its framing ends.
+        if (req.connection) |connection| connection.closing = true;
+        return .{
+            .status = status,
+            .body = try ctx.temporary.alloc(u8, 0),
+            .body_error = if (err == error.StreamTooLong) error.ResponseBodyTooLarge else err,
+        };
+    };
     // allocRemaining accepts EOF, including a premature EOF from Zig's HTTP
     // body reader. Do not accept a valid JSON prefix until HTTP framing ends.
     switch (req.reader.state) {
