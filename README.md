@@ -24,6 +24,8 @@ zig-nico-list --comment 10 --dateafter 20240101 --datebefore 20241231 --url http
 
 Data goes to stdout. Progress, errors, logs, and the summary go to stderr, or logs to `--logfile` when requested. Concurrent invocations coordinate appends to the same regular file. A regular logfile needs read and write access, and a nonempty file must end with a newline. When stdout and `--logfile` share that file, each stdout batch holds the append lock through its last write. This covers hard links and descriptor paths such as `/dev/stderr`. For a piped or socket-backed stderr, `--logfile /dev/stderr` writes through the inherited descriptor. Dates are inclusive. IDs are numerically sorted unless `--no-sort` is set. Use `--help` for all options.
 
+An unterminated logfile tail stops fetching, even when stdin remains open. If logfile setup fails and stderr may share that file, the command exits with status 1 and preserves the existing data without printing an error to the shared stream.
+
 Concurrency controls are independent: `-T` limits active targets, `-P` limits pages per target, and `-H` caps active HTTP requests (`0` means unlimited). `-A` enables adaptive budgets for layers you have not explicitly fixed. Retry backoff, Retry-After, request pacing, cancellation, and natural empty/404 pagination termination are retained. Please respect niconico's rate limits.
 
 ## Build and test

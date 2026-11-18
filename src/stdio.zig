@@ -85,15 +85,22 @@ const Identity = struct {
     }
 };
 
-pub fn openLog(io: Io, path: []const u8) !struct { file: Io.File, regular: bool } {
+pub fn openLog(io: Io, path: []const u8, stderr: Io.File, can_report_on_stderr: *bool) !struct { file: Io.File, regular: bool } {
     const dir = Io.Dir.cwd();
-    const opened = try dir.createFile(io, path, .{ .truncate = false });
+    const opened = dir.createFile(io, path, .{ .truncate = false }) catch |err| {
+        if (descriptorPath(path) == null and (err == error.FileNotFound or err == error.NotDir))
+            can_report_on_stderr.* = true;
+        return err;
+    };
     errdefer opened.close(io);
     if (!try isRegular(io, opened)) return .{ .file = opened, .regular = false };
 
     // Stream destinations retain write-only open semantics. Use one read/write
     // handle for a regular file so tail validation and writes share its lock.
     const identity = Identity.get(opened) orelse return error.LogFileIdentityUnavailable;
+    // Even a write-only handle identifies an alias. Resolve it before reopening
+    // so a failure cannot send a diagnostic through the inherited file offset.
+    if (Identity.get(stderr)) |other| can_report_on_stderr.* = !std.meta.eql(identity, other);
     var path_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
     // Darwin descriptor paths can duplicate the original write-only handle.
     const reopen_path = if (builtin.os.tag == .macos and descriptorPath(path) != null)
@@ -133,6 +140,13 @@ pub const AppendFile = struct {
             if (n != 1 or last[0] != '\n') return error.IncompleteLogRecord;
         }
         return end;
+    }
+
+    pub fn checkInitialTail(self: *AppendFile) !void {
+        // Let an active writer finish, leaving validation to the first append.
+        if (!try self.file.tryLock(self.io, .exclusive)) return;
+        defer self.file.unlock(self.io);
+        _ = try self.checkedEnd();
     }
 
     fn rollback(self: *AppendFile, start: u64, prefix: []const u8) !void {

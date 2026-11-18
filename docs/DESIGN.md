@@ -113,6 +113,13 @@ can then emit the complete record. Every cooperating append checks the file
 tail while holding the lock. If a failed rollback or interrupted writer leaves
 an unterminated tail, the next append fails and preserves the bytes. Shared
 file progress updates end with a newline so they are complete records too.
+The write-only open identifies a regular logfile before the read/write reopen.
+If setup fails and stderr may point at that file, the CLI exits with status 1
+without writing to the inherited offset. Startup checks the tail before
+reading inputs when the lock is available. Under lock contention it defers
+validation to the first append. An incomplete tail or failed rollback during
+an append stops fetching and cancels the input reader. The final report
+retains the original failure.
 Client timeout stays Timeout for
 adaptive overload feedback and is propagated as a terminal page failure. It is
 not retried inside the canceled page future: the supervisor is joining that

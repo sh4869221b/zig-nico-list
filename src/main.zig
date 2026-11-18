@@ -27,14 +27,14 @@ pub fn main(init: std.process.Init) void {
     var logfile: ?stdio.AppendFile = null;
     const result = run(init, &stdout, &stderr, &logfile);
     const flush: FinalFlush = .{ .out = &stdout.interface, .err = &stderr.interface, .result = result };
-    var status = superviseFinalWrite(init.io, FinalFlush.run, .{flush}) catch 1;
+    var status = superviseIo(init.io, FinalFlush.run, .{flush}) catch 1;
     if (stdout.append != null or stderr.append != null)
-        superviseFinalWrite(init.io, stdio.Writer.syncInheritedOffsets, .{ &stdout, &stderr, true }) catch {
+        superviseIo(init.io, stdio.Writer.syncInheritedOffsets, .{ &stdout, &stderr, true }) catch {
             status = 1;
             // A canceled lock wait must not prevent an EOF seek when the
             // inherited handles remain usable. Re-sample EOF without waiting
             // for the lock, in its own bounded shutdown task.
-            superviseFinalWrite(init.io, stdio.Writer.syncInheritedOffsets, .{ &stdout, &stderr, false }) catch {};
+            superviseIo(init.io, stdio.Writer.syncInheritedOffsets, .{ &stdout, &stderr, false }) catch {};
         };
     if (logfile) |file| file.file.close(init.io);
     stdout.id_ends.deinit(init.gpa);
@@ -61,8 +61,13 @@ const Log = struct {
     append: ?*stdio.AppendFile,
     buffer: Io.Writer.Allocating,
     sent: usize = 0,
+    fatal_error: ?anyerror = null,
     shared_stderr: bool = false,
     mutex: Io.Mutex = .init,
+
+    fn isUnsafeAppend(err: anyerror) bool {
+        return err == error.IncompleteLogRecord or err == error.LogRecordRollbackFailed;
+    }
 
     fn writeRecord(self: *Log, comptime encode: anytype, args: anytype) !void {
         try self.mutex.lock(self.io);
@@ -76,17 +81,23 @@ const Log = struct {
         self.flushRecord() catch |err| {
             // Once a prefix has reached the destination, Log owns the rest
             // of this record. The caller must not replay its full contents.
-            if (self.sent != 0) return error.RecordPending;
-            self.buffer.clearRetainingCapacity();
+            if (self.sent == 0) self.buffer.clearRetainingCapacity() else if (!isUnsafeAppend(err)) return error.RecordPending;
             return err;
         };
     }
 
     fn flushRecord(self: *Log) !void {
+        if (self.fatal_error) |err| return err;
         const bytes = self.buffer.written();
         if (bytes.len == 0) return;
         if (self.append) |append| {
-            try append.writeRecord(bytes, &self.sent);
+            append.writeRecord(bytes, &self.sent) catch |err| {
+                if (isUnsafeAppend(err)) {
+                    self.fatal_error = err;
+                    domain.canceled.store(true, .release);
+                }
+                return err;
+            };
         } else {
             while (self.sent < bytes.len) {
                 const n = try self.file.writeStreaming(self.io, &.{}, &.{bytes[self.sent..]}, 1);
@@ -197,7 +208,7 @@ const Runner = struct {
     fn trace(context: ?*anyopaque, value: domain.AttemptTrace) void {
         const self: *Runner = @ptrCast(@alignCast(context.?));
         self.diagnostics.writeRecord(Log.attempt, .{value}) catch |err| {
-            if (err != error.RecordPending)
+            if (err != error.RecordPending and !Log.isUnsafeAppend(err))
                 queueTerminalDiagnostic(context, .{ .body_error = null, .trace = value });
         };
     }
@@ -342,8 +353,8 @@ const BufferedOutput = struct {
     }
 };
 
-fn superviseFinalWrite(io: Io, comptime write: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(write)).@"fn".return_type.?).error_union.payload {
-    const Result = @typeInfo(@TypeOf(write)).@"fn".return_type.?;
+fn superviseIo(io: Io, comptime operation: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(operation)).@"fn".return_type.?).error_union.payload {
+    const Result = @typeInfo(@TypeOf(operation)).@"fn".return_type.?;
     const Task = struct {
         mutex: Io.Mutex = .init,
         changed: Io.Condition = .init,
@@ -356,7 +367,7 @@ fn superviseFinalWrite(io: Io, comptime write: anytype, args: anytype) anyerror!
                 self.changed.signal(task_io);
                 self.mutex.unlock(task_io);
             }
-            return @call(.auto, write, task_args);
+            return @call(.auto, operation, task_args);
         }
     };
     var task: Task = .{};
@@ -367,7 +378,7 @@ fn superviseFinalWrite(io: Io, comptime write: anytype, args: anytype) anyerror!
         const done = task.done;
         task.mutex.unlock(io);
         if (done) return future.await(io);
-        // Input errors stop fetching. Only an external signal interrupts final writes.
+        // Only an external signal interrupts these I/O tasks.
         if (interrupted.load(.acquire)) return future.cancel(io);
     }
 }
@@ -383,7 +394,7 @@ fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, log
     const err = &stderr.interface;
     const args = try init.minimal.args.toSlice(a);
     var parsed = try cli.parse(a, args[1..]);
-    if (parsed.error_message) |message| return superviseFinalWrite(init.io, fail, .{ err, message });
+    if (parsed.error_message) |message| return superviseIo(init.io, fail, .{ err, message });
     switch (parsed.action) {
         .help => {
             try out.writeAll(cli.help_text);
@@ -397,19 +408,27 @@ fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, log
     }
     const cfg = &parsed.config;
     if (init.environ_map.get("NICO_BASE_URL")) |url| cfg.base_url = std.mem.trimEnd(u8, url, "/");
-    if (try cli.validate(a, cfg)) |message| return superviseFinalWrite(init.io, fail, .{ err, message });
+    if (try cli.validate(a, cfg)) |message| return superviseIo(init.io, fail, .{ err, message });
     var append: ?*stdio.AppendFile = null;
     var log_destination = stderr.file;
     if (cfg.logfile.len > 0) {
+        const stderr_regular = stdio.isRegular(init.io, stderr.file);
         const inherited = stdio.descriptorPath(cfg.logfile);
-        if (inherited == null or try stdio.isRegular(init.io, inherited.?)) {
-            const opened = stdio.openLog(init.io, cfg.logfile) catch |e|
-                return superviseFinalWrite(init.io, fail, .{ err, try std.fmt.allocPrint(a, "open {s}: {s}", .{ cfg.logfile, @errorName(e) }) });
+        if (inherited == null or (stderr_regular catch return 1)) {
+            var can_report_on_stderr = !(stderr_regular catch true);
+            const opened = stdio.openLog(init.io, cfg.logfile, stderr.file, &can_report_on_stderr) catch |e| {
+                if (!can_report_on_stderr) return 1;
+                return superviseIo(init.io, fail, .{ err, try std.fmt.allocPrint(a, "open {s}: {s}", .{ cfg.logfile, @errorName(e) }) });
+            };
             logfile.* = .{ .io = init.io, .file = opened.file };
             log_destination = opened.file;
             if (opened.regular) {
                 append = &logfile.*.?;
                 append.?.bind(stdout, stderr);
+                superviseIo(init.io, stdio.AppendFile.checkInitialTail, .{append.?}) catch |e| {
+                    if (!can_report_on_stderr) return 1;
+                    return e;
+                };
             }
         }
     }
@@ -467,12 +486,12 @@ fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, log
             .shared_stdout = if (stdout.append != null) stdout else null,
             .diagnostics = &runner.diagnostics,
         };
-        runner.output_count = superviseFinalWrite(init.io, BufferedOutput.run, .{&output}) catch |e| blk: {
+        runner.output_count = superviseIo(init.io, BufferedOutput.run, .{&output}) catch |e| blk: {
             output_error = e;
             break :blk 0;
         };
     }
-    return superviseFinalWrite(init.io, Runner.report, .{ &runner, input_error, output_error }) catch |e| {
+    return superviseIo(init.io, Runner.report, .{ &runner, input_error, output_error }) catch |e| {
         // Keep an incomplete JSON prefix on stderr free of plain error text.
         if (runner.diagnostics.sent != 0 and log_destination.handle == stderr.file.handle) return 1;
         return e;

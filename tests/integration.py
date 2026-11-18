@@ -824,6 +824,96 @@ class CliIntegration(unittest.TestCase):
             self.assertIn('IncompleteLogRecord', result.stderr)
             self.assertEqual(path.read_bytes(), original)
 
+    @unittest.skipUnless(os.name == 'posix' and os.geteuid() != 0, 'requires non-root POSIX permissions')
+    def test_write_only_log_open_error_preserves_aliased_stderr(self):
+        for alias in ('path', 'hardlink', '/dev/stderr'):
+            if alias.startswith('/') and not Path(alias).exists():
+                continue
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as tmp, fixture() as server:
+                log = Path(tmp) / 'existing.jsonl'
+                original = b'{"msg":"existing audit record"}\n'
+                log.write_bytes(original)
+                if alias == 'hardlink':
+                    supplied = Path(tmp) / 'alias.jsonl'
+                    os.link(log, supplied)
+                else:
+                    supplied = log if alias == 'path' else Path(alias)
+                log.chmod(0o200)
+                env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+                try:
+                    # An inherited write-only descriptor with its offset at zero.
+                    with os.fdopen(os.open(log, os.O_WRONLY), 'wb') as stderr:
+                        result = subprocess.run([BINARY, '--no-progress', '--logfile', str(supplied), USER],
+                                                env=env, stdout=subprocess.PIPE, stderr=stderr, timeout=3)
+                    separate = command(server, '--logfile', str(log), USER)
+                    self.assertEqual(separate.returncode, 1)
+                    self.assertIn(f'open {log}:', separate.stderr)
+                finally:
+                    log.chmod(0o600)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, b'')
+                self.assertEqual(server.requests, [])
+                self.assertEqual(log.read_bytes(), original)
+
+    def test_incomplete_logfile_fails_before_fetch_even_with_open_stdin(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            path = Path(tmp) / 'partial.jsonl'
+            original = b'{"msg":"partial'
+            path.write_bytes(original)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with subprocess.Popen(
+                    [BINARY, '--no-progress', '--stdin', '--http-metrics', '--logfile', str(path), USER],
+                    env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                try:
+                    self.assertEqual(proc.wait(timeout=3), 1)
+                    stdout, stderr = proc.communicate(timeout=3)
+                    self.assertEqual(stdout, b'')
+                    self.assertIn(b'IncompleteLogRecord', stderr)
+                    self.assertEqual(server.requests, [])
+                    self.assertEqual(path.read_bytes(), original)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+            with path.open('r+b') as stderr, subprocess.Popen(
+                    [BINARY, '--no-progress', '--stdin', '--logfile', str(path), USER],
+                    env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr) as proc:
+                try:
+                    self.assertEqual(proc.wait(timeout=3), 1)
+                    self.assertEqual(proc.stdout.read(), b'')
+                    self.assertEqual(server.requests, [])
+                    self.assertEqual(path.read_bytes(), original)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock')
+    def test_incomplete_logfile_detected_after_startup_stops_open_stdin(self):
+        import fcntl
+        def reply(page, attempt, path):
+            return 429, b'', {'Retry-After': '0'}, False
+
+        with tempfile.TemporaryDirectory() as tmp, fixture(reply) as server:
+            path = Path(tmp) / 'partial.jsonl'
+            original = b'{"msg":"partial'
+            path.write_bytes(original)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('r+b') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                with subprocess.Popen(
+                        [BINARY, '--no-progress', '--stdin', '--http-metrics', '--logfile', str(path), USER],
+                        env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                    try:
+                        self.assertTrue(server.headers_sent.wait(3))
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        self.assertEqual(proc.wait(timeout=3), 1)
+                        _, stderr = proc.communicate(timeout=3)
+                        self.assertIn(b'IncompleteLogRecord', stderr)
+                        self.assertEqual(server.requests, [1])
+                        self.assertEqual(path.read_bytes(), original)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+
     @unittest.skipUnless(Path('/dev/stderr').exists(), 'requires /dev/stderr')
     def test_logfile_and_summary_append_to_the_same_regular_stderr(self):
         with tempfile.TemporaryDirectory() as tmp, fixture() as server:
