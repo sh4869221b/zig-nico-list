@@ -22,10 +22,12 @@ pub fn main(init: std.process.Init) void {
     var stdout_buffer: [65536]u8 = undefined;
     var stderr_buffer: [4096]u8 = undefined;
     var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
-    var stderr = Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
-    const result = run(init, &stdout.interface, &stderr.interface);
+    const inherited_stderr = Io.File.stderr();
+    var stderr = inherited_stderr.writerStreaming(init.io, &stderr_buffer);
+    const result = run(init, &stdout.interface, &stderr);
     const flush: FinalFlush = .{ .out = &stdout.interface, .err = &stderr.interface, .result = result };
     const status = superviseFinalWrite(init.io, FinalFlush.run, .{flush}) catch 1;
+    if (stderr.file.handle != inherited_stderr.handle) stderr.file.close(init.io);
     if (status != 0) std.process.exit(status);
 }
 
@@ -62,6 +64,15 @@ const Log = struct {
             else => return err,
         };
         return stat.kind == .file;
+    }
+
+    fn appendStderr(writer: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const stderr: *Io.File.Writer = @fieldParentPtr("interface", writer);
+        const file = stderr.file;
+        file.lock(stderr.io, .exclusive) catch return error.WriteFailed;
+        defer file.unlock(stderr.io);
+        stderr.pos = file.length(stderr.io) catch return error.WriteFailed;
+        return Io.File.Writer.drain(writer, data, splat);
     }
 
     fn writeRecord(self: *Log, comptime encode: anytype, args: anytype) !void {
@@ -133,7 +144,8 @@ const Runner = struct {
     err: *Io.Writer,
     diagnostics: Log,
     terminal_mutex: Io.Mutex = .init,
-    terminal_diagnostics: std.ArrayList(domain.TerminalDiagnostic) = .empty,
+    terminal_diagnostics: std.Deque(domain.TerminalDiagnostic) = .empty,
+    terminal_delivery_paused: bool = false,
     seen: std.StringHashMapUnmanaged(void) = .empty,
     completed: usize = 0,
     total: usize = 0,
@@ -165,6 +177,7 @@ const Runner = struct {
                 }
             },
             .complete => |result| try self.complete(result),
+            .diagnostics => self.emitTerminalDiagnostics(),
         }
     }
 
@@ -181,19 +194,42 @@ const Runner = struct {
         const self: *Runner = @ptrCast(@alignCast(context.?));
         self.terminal_mutex.lockUncancelable(self.init.io);
         defer self.terminal_mutex.unlock(self.init.io);
-        self.terminal_diagnostics.append(self.init.gpa, diagnostic) catch {};
+        self.terminal_diagnostics.pushBack(self.init.gpa, diagnostic) catch {};
+        // The page returns immediately after handing off this record. Its
+        // completion notification also wakes the coordinator for diagnostics.
+    }
+
+    fn hasTerminalDiagnostics(context: *anyopaque) bool {
+        const self: *Runner = @ptrCast(@alignCast(context));
+        self.terminal_mutex.lockUncancelable(self.init.io);
+        defer self.terminal_mutex.unlock(self.init.io);
+        return !self.terminal_delivery_paused and self.terminal_diagnostics.len != 0;
+    }
+
+    fn emitTerminalDiagnostics(self: *Runner) void {
+        self.writeTerminalDiagnostics() catch {
+            // A failed early delivery leaves its cursor for the final report.
+            // Retrying here could spin on a broken diagnostic destination.
+            self.terminal_delivery_paused = true;
+        };
     }
 
     fn writeTerminalDiagnostics(self: *Runner) !void {
-        self.terminal_mutex.lockUncancelable(self.init.io);
-        var diagnostics = self.terminal_diagnostics;
-        self.terminal_diagnostics = .empty;
-        self.terminal_mutex.unlock(self.init.io);
-        defer diagnostics.deinit(self.init.gpa);
-        for (diagnostics.items) |diagnostic| {
-            if (diagnostic.body_error) |name|
+        while (true) {
+            self.terminal_mutex.lockUncancelable(self.init.io);
+            const next = self.terminal_diagnostics.front();
+            self.terminal_mutex.unlock(self.init.io);
+            const diagnostic = next orelse return;
+            if (diagnostic.body_error) |name| {
                 try self.diagnostics.writeRecord(Log.message, .{ "ERROR", "failed to read response body", name });
+                self.terminal_mutex.lockUncancelable(self.init.io);
+                self.terminal_diagnostics.frontPtr().?.body_error = null;
+                self.terminal_mutex.unlock(self.init.io);
+            }
             if (diagnostic.trace) |attempt| try self.diagnostics.writeRecord(Log.attempt, .{attempt});
+            self.terminal_mutex.lockUncancelable(self.init.io);
+            _ = self.terminal_diagnostics.popFront();
+            self.terminal_mutex.unlock(self.init.io);
         }
     }
 
@@ -205,19 +241,11 @@ const Runner = struct {
         try self.results.append(self.ctx.result_allocator, result);
         if (self.cfg.no_sort and !self.cfg.json and result.error_message.len > 0)
             result.error_message = try self.ctx.result_allocator.dupe(u8, result.error_message);
-        if (!domain.canceled.load(.acquire)) self.writeTerminalDiagnostics() catch {};
-        if (result.error_message.len > 0) {
-            self.fetch_err += 1;
-            if (self.first_error == null) self.first_error = result.error_message;
-            if (!domain.canceled.load(.acquire))
-                self.diagnostics.writeRecord(Log.message, .{ "ERROR", "failed to get video list", result.error_message }) catch {};
-        } else self.fetch_ok += 1;
-        if (interrupted.load(.acquire)) return;
-        // Only the sink task owns stdout, dedupe state and output counters.
-        // Keep the diagnostic mutex free while stdout is backpressured so page
-        // jobs can log and finish when the coordinator cancels/joins them.
+        // Committed streaming results reach stdout before this event can
+        // wait for a diagnostic writer or logfile lock.
         if (self.cfg.no_sort and !self.cfg.json and self.output_error == null) {
             var write_failed = false;
+            var count: usize = 0;
             for (result.items) |id| {
                 if (self.cfg.dedupe) {
                     const item = self.seen.getOrPut(self.ctx.result_allocator, id) catch |err| {
@@ -235,7 +263,7 @@ const Runner = struct {
                     write_failed = true;
                     break;
                 };
-                self.output_count += 1;
+                count += 1;
             }
             if (!write_failed) self.out.flush() catch |err| {
                 self.output_error = err;
@@ -243,9 +271,16 @@ const Runner = struct {
             };
             // A failed/canceled write may retain buffered bytes. Retrying them
             // in run/main would block again after a graceful interrupt.
-            if (write_failed) self.out.end = 0;
+            if (write_failed) self.out.end = 0 else self.output_count += count;
             if (self.output_error != null) domain.canceled.store(true, .release);
         }
+        if (!domain.canceled.load(.acquire) and !self.terminal_delivery_paused) self.emitTerminalDiagnostics();
+        if (result.error_message.len > 0) {
+            self.fetch_err += 1;
+            if (self.first_error == null) self.first_error = result.error_message;
+            if (!domain.canceled.load(.acquire))
+                self.diagnostics.writeRecord(Log.message, .{ "ERROR", "failed to get video list", result.error_message }) catch {};
+        } else self.fetch_ok += 1;
         self.completed += 1;
         self.progress();
     }
@@ -316,8 +351,9 @@ fn fail(err: *Io.Writer, text: []const u8) !u8 {
     try err.print("Error: {s}\n", .{text});
     return 1;
 }
-fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
+fn run(init: std.process.Init, out: *Io.Writer, stderr: *Io.File.Writer) !u8 {
     const a = init.arena.allocator();
+    const err = &stderr.interface;
     const args = try init.minimal.args.toSlice(a);
     var parsed = try cli.parse(a, args[1..]);
     if (parsed.error_message) |message| return superviseFinalWrite(init.io, fail, .{ err, message });
@@ -335,12 +371,23 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
     const cfg = &parsed.config;
     if (init.environ_map.get("NICO_BASE_URL")) |url| cfg.base_url = std.mem.trimEnd(u8, url, "/");
     if (try cli.validate(a, cfg)) |message| return superviseFinalWrite(init.io, fail, .{ err, message });
-    const logfile = if (cfg.logfile.len > 0)
+    const aliases_stderr = (builtin.os.tag == .linux or builtin.os.tag == .macos) and std.mem.eql(u8, cfg.logfile, "/dev/stderr");
+    const append_stderr = aliases_stderr and try Log.isRegularFile(init.io, stderr.file);
+    const logfile = if (cfg.logfile.len > 0 and (!aliases_stderr or append_stderr))
         Io.Dir.cwd().createFile(init.io, cfg.logfile, .{ .truncate = false }) catch |e|
             return superviseFinalWrite(init.io, fail, .{ err, try std.fmt.allocPrint(a, "open {s}: {s}", .{ cfg.logfile, @errorName(e) }) })
     else
         null;
-    defer if (logfile) |file| file.close(init.io);
+    defer if (!append_stderr) {
+        if (logfile) |file| file.close(init.io);
+    };
+    if (append_stderr) {
+        // JSONL and text share the same destination. Append all text writes
+        // under the same file lock. Main keeps this handle through its final flush.
+        stderr.file = logfile.?;
+        stderr.mode = .positional;
+        stderr.interface.vtable = &.{ .drain = Log.appendStderr };
+    }
     var control = domain.Control.init(init.io, cfg);
     var client: HttpClient = .{ .allocator = init.gpa, .io = init.io };
     defer client.deinit();
@@ -359,7 +406,7 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
             .io = init.io,
             .err = err,
             .file = logfile,
-            .append = if (logfile) |file| try Log.isRegularFile(init.io, file) else false,
+            .append = append_stderr or if (logfile) |file| try Log.isRegularFile(init.io, file) else false,
             .buffer = .init(init.gpa),
         },
         .ctx = .{ .result_allocator = a, .temporary = init.gpa, .io = init.io, .cfg = cfg, .control = &control, .client = &client },
@@ -372,7 +419,11 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
     runner.ctx.log_fn = Runner.log;
     runner.ctx.trace_fn = Runner.trace;
     runner.ctx.terminal_diagnostic_fn = Runner.queueTerminalDiagnostic;
-    var engine = scheduler.Scheduler.init(init.gpa, runner.ctx, .{ .context = &runner, .emit = Runner.event });
+    var engine = scheduler.Scheduler.init(init.gpa, runner.ctx, .{
+        .context = &runner,
+        .emit = Runner.event,
+        .has_diagnostics = Runner.hasTerminalDiagnostics,
+    });
     defer engine.deinit();
     const input_error = try engine.run(parsed.inputs);
     const results = try a.alloc(cli.TargetResult, runner.results.items.len);
@@ -412,6 +463,53 @@ test "buffered output discards bytes after serialization and flush failures" {
         try writer.interface.flush();
         try std.testing.expectEqual(@as(usize, 1), writer.calls);
     }
+}
+
+test "terminal diagnostics resume after the last completed record" {
+    const FailSecond = struct {
+        interface: Io.Writer,
+        collected: *Io.Writer,
+        writes: usize = 0,
+
+        fn drain(writer: *Io.Writer, _: []const []const u8, _: usize) Io.Writer.Error!usize {
+            const self: *@This() = @fieldParentPtr("interface", writer);
+            self.writes += 1;
+            if (self.writes == 2) return error.WriteFailed;
+            try self.collected.writeAll(writer.buffered());
+            return writer.consume(writer.end);
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var storage: [4096]u8 = undefined;
+    var output: [4096]u8 = undefined;
+    var collected = Io.Writer.fixed(&output);
+    var writer: FailSecond = .{
+        .interface = .{ .buffer = &storage, .vtable = &.{ .drain = FailSecond.drain } },
+        .collected = &collected,
+    };
+    var runner: Runner = .{
+        .init = .{ .minimal = undefined, .arena = undefined, .gpa = a, .io = io, .environ_map = undefined, .preopens = undefined },
+        .cfg = undefined,
+        .ctx = undefined,
+        .out = undefined,
+        .err = &writer.interface,
+        .diagnostics = .{ .io = io, .err = &writer.interface, .file = null, .append = false, .buffer = .init(a) },
+        .show_progress = false,
+    };
+    defer runner.terminal_diagnostics.deinit(a);
+    try runner.terminal_diagnostics.pushBack(a, .{ .body_error = "Timeout", .trace = .{ .request_id = 12 } });
+    try runner.terminal_diagnostics.pushBack(a, .{ .body_error = null, .trace = .{ .request_id = 13 } });
+    try std.testing.expectError(error.WriteFailed, runner.writeTerminalDiagnostics());
+    try std.testing.expectEqual(@as(usize, 2), runner.terminal_diagnostics.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), runner.terminal_diagnostics.front().?.body_error);
+    try runner.writeTerminalDiagnostics();
+    try std.testing.expectEqual(@as(usize, 0), runner.terminal_diagnostics.len);
+    var lines = std.mem.tokenizeScalar(u8, collected.buffered(), '\n');
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "\"error\":\"Timeout\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "\"request_id\":12,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "\"request_id\":13,") != null);
+    try std.testing.expect(lines.next() == null);
 }
 
 test {

@@ -707,6 +707,26 @@ class CliIntegration(unittest.TestCase):
         self.assertEqual([record['msg'] for record in records],
                          ['http_attempt', 'video list', 'http_metrics'])
 
+    @unittest.skipUnless(Path('/dev/stderr').exists(), 'requires /dev/stderr')
+    def test_logfile_and_summary_append_to_the_same_regular_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            path = Path(tmp) / 'stderr.log'
+            prefix = b'{"msg":"existing"}\n'
+            path.write_bytes(prefix)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('r+b') as stderr:
+                result = subprocess.run([BINARY, '--no-progress', '-P2', '--http-metrics',
+                                         '--logfile', '/dev/stderr', USER],
+                                        env=env, stdout=subprocess.PIPE, stderr=stderr, timeout=5)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b'sm2\nsm10\n')
+            self.assertTrue(path.read_bytes().startswith(prefix), path.read_bytes())
+            lines = path.read_text().splitlines()
+            self.assertEqual([json.loads(line)['msg'] for line in lines if line.startswith('{')],
+                             ['existing', 'http_attempt', 'video list', 'http_metrics'])
+            self.assertEqual(len(lines), 5)
+            self.assertTrue(any(line.startswith('summary ') for line in lines))
+
     def test_concurrent_logfile_writers_append_complete_records(self):
         both_open = threading.Event()
 
@@ -833,6 +853,129 @@ class CliIntegration(unittest.TestCase):
                         finish_second.set()
                         if proc.poll() is None:
                             proc.kill()
+
+    def test_timeout_trace_precedes_an_earlier_pages_retry(self):
+        second_retried = threading.Event()
+        second_started = threading.Event()
+        third_started = threading.Event()
+
+        def reply(page, *_):
+            if page == 1:
+                return 200, body(('sm1',), total=300), {}, False
+            if page == 3:
+                third_started.set()
+                return 200, body(('sm3',), total=300), {}, True
+            if second_started.is_set():
+                second_retried.set()
+                return 200, body(('sm2',), total=300), {}, False
+            second_started.set()
+            return 429, b'', {'Retry-After': '2'}, False
+
+        with tempfile.TemporaryDirectory() as tmp, fixture(reply) as server:
+            path = Path(tmp) / 'timeouts.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with subprocess.Popen(
+                    [BINARY, '--no-progress', '-P3', '-H3', '--retries', '2', '--timeout', '250ms',
+                     '--http-metrics', '--logfile', str(path), '--json', USER],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                try:
+                    self.assertTrue(second_started.wait(3))
+                    self.assertTrue(third_started.wait(3))
+                    early_trace = False
+                    until = time.monotonic() + 3
+                    while not second_retried.is_set() and time.monotonic() < until:
+                        with path.open('rb') as logs:
+                            logs.seek(1)  # Avoid the first-byte lock on Windows.
+                            early_trace = any(b'"page":3' in line and b'"error_name":"Timeout"' in line
+                                              for line in logs)
+                        if early_trace:
+                            break
+                        time.sleep(.01)
+                    stdout, stderr = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, 1, stderr)
+                    self.assertEqual(json.loads(stdout)['items'], ['sm1', 'sm2'])
+                    self.assertTrue(second_retried.is_set())
+                    self.assertTrue(early_trace, 'page 3 diagnostics waited for page 2 to retry')
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock and SIGTERM')
+    def test_sigterm_keeps_a_completed_no_sort_result_while_diagnostics_wait(self):
+        import fcntl
+        let_success_finish = threading.Event()
+        success_requested = threading.Event()
+
+        def reply(page, attempt, path):
+            if '/users/2/' in path:
+                success_requested.set()
+                let_success_finish.wait(5)
+                return 200, body(('sm2',)), {}, False
+            return 200, body(('sm1',)), {}, True
+
+        with tempfile.TemporaryDirectory() as tmp, fixture(reply) as server:
+            path = Path(tmp) / 'locked.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('wb') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                with subprocess.Popen(
+                        [BINARY, '--stdin', '--no-progress', '--no-sort', '--best-effort',
+                         '-T2', '-P2', '--timeout', '1s', '--logfile', str(path), USER],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                    try:
+                        self.assertTrue(server.headers_sent.wait(3))
+                        time.sleep(.55)
+                        proc.stdin.write(b'https://www.nicovideo.jp/user/2\n')
+                        proc.stdin.flush()
+                        self.assertTrue(success_requested.wait(2))
+                        # Target 1 times out and waits on the log. Target 2 can
+                        # finish on its own socket with the same request timeout.
+                        time.sleep(.55)
+                        let_success_finish.set()
+                        time.sleep(.18)
+                        proc.send_signal(signal.SIGTERM)
+                        # Stdout should finish before the locked final report.
+                        self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        stdout, stderr = proc.communicate(timeout=5)
+                        self.assertEqual(stdout, b'sm2\n')
+                        self.assertEqual(proc.returncode, 0, stderr)
+                        self.assertIn(b'fetch_ok=1 fetch_err=1 output_count=1', stderr)
+                    finally:
+                        let_success_finish.set()
+                        if proc.poll() is None:
+                            proc.kill()
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock and SIGTERM')
+    def test_sigterm_retries_pending_terminal_diagnostics_in_the_final_report(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp, fixture(
+                lambda *_: (200, body(), {}, True)) as server:
+            path = Path(tmp) / 'locked.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('wb') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                with subprocess.Popen(
+                        [BINARY, '--no-progress', '--json', '--best-effort', '--http-metrics',
+                         '--timeout', '250ms', '--logfile', str(path), USER],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                    try:
+                        self.assertTrue(server.headers_sent.wait(3))
+                        time.sleep(.45)
+                        self.assertEqual(path.stat().st_size, 0)
+                        proc.send_signal(signal.SIGTERM)
+                        self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        _, stderr = proc.communicate(timeout=5)
+                        self.assertEqual(proc.returncode, 0, stderr)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(sum(row.get('error') == 'Timeout' and
+                                 row['msg'] == 'failed to read response body' for row in records), 1)
+            self.assertEqual(sum(row.get('attempt', {}).get('error_name') == 'Timeout'
+                                 for row in records), 1)
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX graceful SIGTERM test')
     def test_sigterm_cancels_inflight_diagnostics_with_full_stderr(self):

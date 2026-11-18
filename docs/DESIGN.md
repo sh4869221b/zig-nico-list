@@ -66,13 +66,13 @@ active deadline, with a 20 ms maximum signal-poll interval. Completion checks
 its own timestamp as well, so a short timeout cannot be missed between polls.
 
 The coordinator continues deadline and cancellation supervision while its one
-sink task emits an event, including when stdout or stderr is blocked. It does not admit
-more input or launch more page work during emission. There is no output queue,
-and it joins the sink before releasing borrowed page memory or emitting another
-event. Diagnostic mutex acquisition and writes can be canceled. The sink
-releases the diagnostic mutex before writing stdout, and caller cancellation
-releases a blocked sink before the coordinator joins other pages. Failed
-writes are not flushed again from a later cleanup path.
+sink task emits an event, including when stdout or stderr is blocked. It does
+not admit more input or launch more page work during emission. It joins the
+sink before releasing borrowed page memory or emitting another event. With
+`--no-sort`, the sink flushes a completed target's stdout before delivering
+its diagnostics. Diagnostic mutex acquisition and writes can be canceled.
+Caller cancellation releases a blocked sink before the coordinator joins
+other pages. Failed stdout writes are not retried during cleanup.
 After fetching finishes, sorted line output and JSON serialization plus their
 final flush run in an awaited output task. The final diagnostics and stream
 flushes use the same signal polling, so full stdout and stderr pipes remain
@@ -87,9 +87,11 @@ Io.Future.cancel cancellation is consumed at the next cancellation point, and
 std.http or a diagnostic write may wrap the error. The owning Deadline
 preserves the reason independently of the returned error. Page jobs check
 the abort flag after diagnostics, during backoff and admission, and before
-starting and sending another request. Workers hand off timeout and cancellation
-diagnostics in memory so the coordinator can join them without waiting for
-the diagnostic writer.
+starting and sending another request. Workers hand off timeout and
+cancellation diagnostics in memory and wake the coordinator as they finish.
+The sink can emit these diagnostics before the target completes. When the
+sink is interrupted, it leaves pending records for the final report and
+keeps track of which records have already been delivered.
 Client timeout stays Timeout for
 adaptive overload feedback and is propagated as a terminal page failure. It is
 not retried inside the canceled page future: the supervisor is joining that

@@ -9,10 +9,10 @@ const domain = @import("domain.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-pub const Event = union(enum) { input: []const u8, complete: *cli.TargetResult };
+pub const Event = union(enum) { input: []const u8, complete: *cli.TargetResult, diagnostics };
 /// The coordinator waits for each event's sink task before emitting another.
 /// While waiting it continues to supervise page deadlines and cancellation.
-/// Page jobs never emit events, and there is no output queue.
+/// Page jobs never emit events. Result data is handed directly to the sink.
 /// Input strings and result records are borrowed until Scheduler.deinit. Page
 /// ID/error storage also lives until deinit for buffered output, but in no-sort
 /// non-JSON mode it is released as soon as the complete callback returns. A sink
@@ -21,6 +21,7 @@ pub const Event = union(enum) { input: []const u8, complete: *cli.TargetResult }
 pub const Sink = struct {
     context: *anyopaque,
     emit: *const fn (*anyopaque, Event) anyerror!void,
+    has_diagnostics: ?*const fn (*anyopaque) bool = null,
 };
 
 pub const Scheduler = struct {
@@ -239,11 +240,17 @@ pub const Scheduler = struct {
         // Backpressure stops admission, but cannot stop HTTP supervision.
         var emission: Emission = .{ .scheduler = self, .event = event };
         var future = try Io.concurrent(self.ctx.io, Emission.run, .{&emission});
+        // Give newly handed-off stdout a signal poll to complete on a
+        // writable destination, even if shutdown has already started.
+        var first_poll = true;
+        const has_stdout = event == .complete and event.complete.items.len != 0 and
+            self.ctx.cfg.no_sort and !self.ctx.cfg.json;
         while (!emission.done.load(.acquire)) {
             self.mutex.lockUncancelable(self.ctx.io);
             const epoch = self.epoch;
             self.mutex.unlock(self.ctx.io);
-            if (domain.canceled.load(.acquire)) {
+            const cancel_all = domain.canceled.load(.acquire);
+            if (cancel_all and !(first_poll and has_stdout)) {
                 self.input_future.?.cancel(self.ctx.io);
                 // Release the sink's writers before joining any other pages.
                 // A page can be waiting for the sink's diagnostic mutex.
@@ -251,9 +258,10 @@ pub const Scheduler = struct {
                     if (err != error.Canceled) return err;
                 };
             }
-            for (self.targets.items) |target| {
+            if (!cancel_all) for (self.targets.items) |target| {
                 if (!target.finished) self.joinReady(target, false);
-            }
+            };
+            first_poll = false;
             self.waitForChange(epoch);
         }
         try future.await(self.ctx.io);
@@ -290,10 +298,17 @@ pub const Scheduler = struct {
                 if (target.finished) continue;
                 self.joinReady(target, cancel_all);
                 try self.commitReady(target);
-                if (cancel_all) target.canceled = true;
-                if (target.running == 0 and (cancel_all or target.next_page > target.last_page or target.next_page >= target.stop_before))
+                const complete = target.next_page > target.last_page or target.next_page >= target.stop_before;
+                if (cancel_all and !complete) target.canceled = true;
+                if (target.running == 0 and (cancel_all or complete))
                     try self.finish(target);
             }
+            // A timeout can finish out of order while an earlier page is
+            // still backing off. Deliver its diagnostics through the same
+            // deadline-supervised sink without waiting for target completion.
+            if (!domain.canceled.load(.acquire)) if (self.sink.has_diagnostics) |pending| {
+                if (pending(self.sink.context)) try self.emit(.diagnostics);
+            };
             const budget = self.ctx.control.workerBudgets();
             if (!cancel_all) {
                 self.mutex.lockUncancelable(self.ctx.io);
