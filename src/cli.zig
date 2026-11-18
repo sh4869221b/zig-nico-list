@@ -501,14 +501,15 @@ pub fn trimSpace(text: []const u8) []const u8 {
     var leading = true;
     var i: usize = 0;
     while (i < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        var valid_len = @min(@as(usize, len), text.len - i);
-        const rune = std.unicode.utf8Decode(text[i .. i + valid_len]) catch blk: {
-            valid_len = 1;
-            break :blk @as(u21, 0xfffd);
+        const rune = rune: {
+            const len = std.unicode.utf8ByteSequenceLength(text[i]) catch break :rune 0xfffd;
+            if (len > text.len - i) break :rune 0xfffd;
+            const decoded = std.unicode.utf8Decode(text[i..][0..len]) catch break :rune 0xfffd;
+            i += len - 1;
+            break :rune decoded;
         };
         const ws = (rune >= 9 and rune <= 13) or rune == 32 or rune == 0x85 or rune == 0xa0 or rune == 0x1680 or (rune >= 0x2000 and rune <= 0x200a) or rune == 0x2028 or rune == 0x2029 or rune == 0x202f or rune == 0x205f or rune == 0x3000;
-        i += valid_len;
+        i += 1;
         if (leading and ws) start = i else leading = false;
         if (!ws) last_nonspace = i;
     }

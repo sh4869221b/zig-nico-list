@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Offline, cross-platform CLI integration checks; no niconico network traffic."""
 import contextlib
+import datetime
+import email.utils
+import gzip
 import http.server
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
+import zlib
 
 import scheduler_regressions
 import stale_connection_regressions
@@ -42,6 +48,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with self.server.lock:
             self.server.requests.append(page)
             self.server.connections.append(self.client_address)
+            self.server.accept_encodings.append(self.headers.get('Accept-Encoding', ''))
             attempt = len(self.server.requests)
         status, payload, headers, stall = self.server.reply(page, attempt, self.path)
         if status == 0:
@@ -76,6 +83,7 @@ def fixture(reply=None):
     server.lock = threading.Lock()
     server.requests = []
     server.connections = []
+    server.accept_encodings = []
     server.release = threading.Event()
     server.headers_sent = threading.Event()
     server.reply = reply or (lambda p, a, path: (200, body(mylist='/mylists/' in path) if p == 1 else body(()), {}, False))
@@ -90,10 +98,27 @@ def fixture(reply=None):
         thread.join()
 
 
-def command(server, *args, **kwargs):
+def command(server, *args, process_timeout=15, **kwargs):
     env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
     return subprocess.run([BINARY, '--no-progress', '--retries', '2', '--timeout', '2s', *args],
-                          env=env, capture_output=True, text=True, timeout=15, **kwargs)
+                          env=env, capture_output=True, text=True, timeout=process_timeout, **kwargs)
+
+
+@contextlib.contextmanager
+def full_pipe():
+    read_end, write_end = os.pipe()
+    try:
+        os.set_blocking(write_end, False)
+        try:
+            while True:
+                os.write(write_end, b'x' * 512)
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_end, True)
+        yield write_end
+    finally:
+        os.close(write_end)
+        os.close(read_end)
 
 
 class CliIntegration(unittest.TestCase):
@@ -364,8 +389,108 @@ class CliIntegration(unittest.TestCase):
         wire = (f'{middle:x};fixture=yes\r\n'.encode() + payload[:middle] + b'\r\n' +
                 f'{len(payload) - middle:x}\r\n'.encode() + payload[middle:] +
                 b'\r\n0\r\nX-Fixture: complete\r\n\r\n')
-        with fixture(lambda *_: (200, wire, {'Transfer-Encoding': 'chunked'}, False)) as server:
-            self.check_ok(command(server, '-P2', '--http-metrics', USER), 'sm1\n')
+        for coding in ('chunked', 'Chunked'):
+            with self.subTest(coding=coding), fixture(
+                    lambda *_: (200, wire, {'Transfer-Encoding': coding}, False)) as server:
+                self.check_ok(command(server, '-P2', '--http-metrics', USER), 'sm1\n')
+
+    def test_compressed_pages_and_chunked_trailers(self):
+        payload = body(('sm1',), total=200)
+        for name, encoding, wire in (
+                ('gzip', 'gzip', gzip.compress(payload)),
+                ('multi-member gzip', 'GZip', gzip.compress(payload[:30]) + gzip.compress(payload[30:])),
+                ('deflate', 'deflate', zlib.compress(payload))):
+            for chunked in (False, True):
+                headers = {'Content-Encoding': encoding}
+                framed = wire
+                if chunked:
+                    headers['Transfer-Encoding'] = 'chunked'
+                    framed = f'{len(wire):x}\r\n'.encode() + wire + b'\r\n0\r\nX-Fixture: complete\r\n\r\n'
+
+                def reply(page, *_):
+                    if page == 1:
+                        return 200, framed, headers, False
+                    return 200, body(('sm2',), total=200), {}, False
+
+                with self.subTest(name=name, chunked=chunked), fixture(reply) as server:
+                    self.check_ok(command(server, '-P2', USER), 'sm1\nsm2\n')
+                    self.assertEqual(server.requests, [1, 2])
+                    self.assertEqual(len(set(server.connections)), 1)
+                    self.assertIn(encoding.lower(),
+                                  [token.strip() for token in server.accept_encodings[0].split(',')])
+
+    def test_gzip_decoded_size_and_complete_framing(self):
+        valid = body(('sm1',))
+        limit = 8 * 1024 * 1024
+        exact = gzip.compress(valid + b' ' * (limit - len(valid)))
+        oversized = gzip.compress(valid + b' ' * (limit + 1 - len(valid)))
+        small = gzip.compress(valid)
+        corrupt = small[:-8] + bytes([small[-8] ^ 1]) + small[-7:]
+        for name, wire, headers, error in (
+                ('exact', exact, {}, None),
+                ('oversized', oversized, {}, 'ResponseBodyTooLarge'),
+                ('bad checksum', corrupt, {}, 'InvalidCompressedResponseBody'),
+                ('gzip missing footer', small[:-2], {}, 'InvalidCompressedResponseBody'),
+                ('short Content-Length', small, {'Content-Length': str(len(small) + 1),
+                                                 'Connection': 'close'}, 'TruncatedResponseBody'),
+                ('missing last chunk', f'{len(small):x}\r\n'.encode() + small + b'\r\n',
+                 {'Transfer-Encoding': 'chunked', 'Connection': 'close'}, 'ReadFailed')):
+            with self.subTest(name=name), fixture(
+                    lambda *_: (200, wire, {'Content-Encoding': 'gzip', **headers}, False)) as server:
+                result = command(server, '-P2', '--http-metrics', USER)
+                if error is None:
+                    self.check_ok(result, 'sm1\n')
+                else:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn(f'Error: {error}\n', result.stderr)
+                self.assertEqual(server.requests, [1])
+
+    def test_compression_requires_valid_member_headers(self):
+        payload = body(('sm1',))
+        gzip_wire = gzip.compress(payload)
+        gzip_reserved = gzip_wire[:3] + bytes([gzip_wire[3] | 0x20]) + gzip_wire[4:]
+        empty_member = gzip.compress(b'')
+        empty_reserved = empty_member[:3] + bytes([empty_member[3] | 0x20]) + empty_member[4:]
+        zlib_wire = zlib.compress(payload)
+        bad_fcheck = zlib_wire[:1] + bytes([zlib_wire[1] ^ 1]) + zlib_wire[2:]
+        # Set FDICT and recalculate FCHECK without adding a dictionary ID.
+        # A decoder that ignores FLG will accept the following DEFLATE stream.
+        cmf = zlib_wire[0]
+        flg = 0x20
+        flg += (-(cmf * 256 + flg)) % 31
+        no_dictionary = bytes([cmf, flg]) + zlib_wire[2:]
+        for label, encoding, compressed in (
+                ('gzip reserved bit', 'gzip', gzip_reserved),
+                ('second gzip member reserved bit', 'gzip', gzip_wire + empty_reserved),
+                ('zlib FCHECK', 'deflate', bad_fcheck),
+                ('zlib FDICT', 'deflate', no_dictionary)):
+            with self.subTest(case=label), fixture(
+                    lambda *_: (200, compressed, {'Content-Encoding': encoding}, False)) as server:
+                result = command(server, '-P2', '--http-metrics', USER)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('Error: InvalidCompressedResponseBody\n', result.stderr)
+                self.assertEqual(server.requests, [1])
+
+    def test_invalid_retry_after_uses_normal_backoff(self):
+        for case in ('underscore', 'timezone', 'weekday'):
+            future_date = email.utils.format_datetime(
+                datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=4), usegmt=True)
+            wrong_weekday = 'Tue' if future_date.startswith('Mon') else 'Mon'
+            value = {'underscore': '0_2', 'timezone': future_date.replace('GMT', 'PST'),
+                     'weekday': wrong_weekday + future_date[3:]}[case]
+            def reply(page, attempt, path):
+                return ((429, b'', {'Retry-After': value}, False) if attempt == 1
+                        else (200, body(('sm1',)), {}, False))
+
+            with self.subTest(value=value), fixture(reply) as server:
+                result = command(server, '-P2', '--http-metrics', USER)
+                self.check_ok(result, 'sm1\n')
+                rows = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+                metrics = next(row['http']['metrics'] for row in rows if row.get('msg') == 'http_metrics')
+                self.assertEqual(metrics['backoff_wait_ns'], 100_000_000)
+                self.assertEqual(server.requests, [1, 1])
 
     def test_empty_404_can_reuse_connection_for_next_target(self):
         def reply(page, attempt, path):
@@ -573,6 +698,749 @@ class CliIntegration(unittest.TestCase):
             self.assertTrue(appended.startswith(first))
             self.assertGreater(len(appended), len(first))
 
+    @unittest.skipUnless(Path('/dev/stderr').exists(), 'requires /dev/stderr')
+    def test_logfile_can_stream_to_stderr_pipe(self):
+        with fixture() as server:
+            result = command(server, '-P2', '--logfile', '/dev/stderr', '--http-metrics', USER)
+            self.check_ok(result, 'sm2\nsm10\n')
+        records = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+        self.assertEqual([record['msg'] for record in records],
+                         ['http_attempt', 'video list', 'http_metrics'])
+
+    @unittest.skipUnless(os.name == 'posix' and Path('/dev/stderr').exists(), 'requires Unix stderr')
+    def test_logfile_reuses_an_inherited_unix_socket(self):
+        with fixture() as server, contextlib.ExitStack() as stack:
+            reader, writer = socket.socketpair()
+            stack.enter_context(reader)
+            stack.enter_context(writer)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            result = subprocess.run([BINARY, '--no-progress', '-P2', '--http-metrics',
+                                     '--logfile', '/dev/stderr', USER],
+                                    stdout=subprocess.PIPE, stderr=writer, env=env, timeout=5)
+            writer.close()
+            reader.settimeout(5)
+            with reader.makefile('rb') as stream:
+                diagnostics = stream.read().splitlines()
+            self.assertEqual(result.returncode, 0, diagnostics)
+            self.assertEqual(result.stdout, b'sm2\nsm10\n')
+            self.assertEqual([json.loads(line)['msg'] for line in diagnostics if line.startswith(b'{')],
+                             ['http_attempt', 'video list', 'http_metrics'])
+            self.assertTrue(any(line.startswith(b'summary ') for line in diagnostics))
+
+    def test_multiline_id_counts_as_one_result_in_all_modes(self):
+        with fixture(lambda *_: (200, body(('sm1\npart', 'sm2')), {}, False)) as server:
+            for flags in ([], ['--no-sort'], ['--json'], ['--no-sort', '--json']):
+                with self.subTest(flags=flags):
+                    result = command(server, '-P2', *flags, USER)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('output_count=2\n', result.stderr)
+                    if '--json' in flags:
+                        self.assertCountEqual(json.loads(result.stdout)['items'], ['sm1\npart', 'sm2'])
+                    else:
+                        self.assertCountEqual(result.stdout.splitlines(), ['sm1', 'part', 'sm2'])
+
+    def test_shared_regular_file_keeps_large_id_records_whole(self):
+        ids = ['sm' + str(i) * 66000 for i in range(8)]
+        payload = body(ids)
+        with tempfile.TemporaryDirectory() as tmp, fixture(
+                lambda *_: (200, payload, {}, False)) as server, contextlib.ExitStack() as stack:
+            path = Path(tmp) / 'shared.log'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            shared = stack.enter_context(path.open('wb'))
+            children = [stack.enter_context(subprocess.Popen(
+                [BINARY, '--no-progress', '-P2', '--http-metrics', '--logfile', str(path),
+                 *(['--no-sort'] if i % 2 else []), USER],
+                stdout=shared, stderr=subprocess.PIPE, env=env)) for i in range(6)]
+            try:
+                for child in children:
+                    _, stderr = child.communicate(timeout=8)
+                    self.assertEqual(child.returncode, 0, stderr)
+                    self.assertIn(b'output_count=8', stderr)
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+            lines = path.read_text().splitlines()
+            self.assertEqual(sorted(line for line in lines if not line.startswith('{')), sorted(ids * len(children)))
+            self.assertCountEqual([json.loads(line)['msg'] for line in lines if line.startswith('{')],
+                                  ['http_attempt', 'video list', 'http_metrics'] * len(children))
+
+    @unittest.skipUnless(sys.platform == 'linux', 'requires Linux prlimit')
+    def test_partial_trace_is_rolled_back_before_another_process_appends(self):
+        import resource
+        let_request_finish = threading.Event()
+        request_started = threading.Event()
+
+        def reply(page, attempt, path):
+            if attempt == 1:
+                request_started.set()
+                let_request_finish.wait(5)
+                return 429, b'', {'Retry-After': '2'}, False
+            return 200, body(('sm1',)), {}, False
+
+        with fixture(reply) as server, tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'trace.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            # Keep the process alive when the kernel rejects the next write at the limit.
+            launcher = 'import os,signal,sys; signal.signal(signal.SIGXFSZ, signal.SIG_IGN); os.execv(sys.argv[1], sys.argv[1:])'
+            with subprocess.Popen(
+                    [sys.executable, '-c', launcher, BINARY, '--no-progress', '-P2',
+                     '--http-metrics', '--logfile', str(log), USER],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                try:
+                    self.assertTrue(request_started.wait(3))
+                    old_limit = resource.prlimit(proc.pid, resource.RLIMIT_FSIZE)
+                    resource.prlimit(proc.pid, resource.RLIMIT_FSIZE, (150, old_limit[1]))
+                    let_request_finish.set()
+                    # Give the first writer time to hit the limit and enter
+                    # Retry-After. The other process has its normal file limit.
+                    time.sleep(.25)
+                    competing = command(server, '-P2', '--http-metrics', '--logfile', str(log), USER)
+                    self.check_ok(competing, 'sm1\n')
+                    self.assertIsNone(proc.poll())
+                    competing_records = log.read_text()
+                    resource.prlimit(proc.pid, resource.RLIMIT_FSIZE, old_limit)
+                    stdout, stderr = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, 0, stderr)
+                    self.assertEqual(stdout, b'sm1\n')
+                finally:
+                    let_request_finish.set()
+                    if proc.poll() is None:
+                        proc.kill()
+            early_rows = [json.loads(line) for line in competing_records.splitlines()]
+            self.assertEqual([row['attempt']['status'] for row in early_rows if row['msg'] == 'http_attempt'], [200])
+            records = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertCountEqual([(row['attempt']['request_id'], row['attempt']['status'])
+                                   for row in records if row['msg'] == 'http_attempt'],
+                                  [(1, 200), (1, 429), (2, 200)])
+
+    def test_regular_logfile_refuses_an_incomplete_tail_from_another_writer(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            path = Path(tmp) / 'partial.jsonl'
+            original = b'{"msg":"previous"}\n{"msg":"partial'
+            path.write_bytes(original)
+            result = command(server, '-P2', '--http-metrics', '--logfile', str(path), USER)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('IncompleteLogRecord', result.stderr)
+            self.assertEqual(path.read_bytes(), original)
+
+    @unittest.skipUnless(os.name == 'posix' and os.geteuid() != 0, 'requires non-root POSIX permissions')
+    def test_write_only_log_open_error_preserves_aliased_stderr(self):
+        for alias in ('path', 'hardlink', '/dev/stderr'):
+            if alias.startswith('/') and not Path(alias).exists():
+                continue
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as tmp, fixture() as server:
+                log = Path(tmp) / 'existing.jsonl'
+                original = b'{"msg":"existing audit record"}\n'
+                log.write_bytes(original)
+                if alias == 'hardlink':
+                    supplied = Path(tmp) / 'alias.jsonl'
+                    os.link(log, supplied)
+                else:
+                    supplied = log if alias == 'path' else Path(alias)
+                log.chmod(0o200)
+                env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+                try:
+                    # An inherited write-only descriptor with its offset at zero.
+                    with os.fdopen(os.open(log, os.O_WRONLY), 'wb') as stderr:
+                        result = subprocess.run([BINARY, '--no-progress', '--logfile', str(supplied), USER],
+                                                env=env, stdout=subprocess.PIPE, stderr=stderr, timeout=3)
+                    separate = command(server, '--logfile', str(log), USER)
+                    self.assertEqual(separate.returncode, 1)
+                    self.assertIn(f'open {log}:', separate.stderr)
+                finally:
+                    log.chmod(0o600)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, b'')
+                self.assertEqual(server.requests, [])
+                self.assertEqual(log.read_bytes(), original)
+
+    def test_logfile_directory_error_reaches_separate_regular_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            log = Path(tmp) / 'log-directory'
+            log.mkdir()
+            stderr_path = Path(tmp) / 'stderr.txt'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with stderr_path.open('wb') as stderr:
+                result = subprocess.run([BINARY, '--no-progress', '--logfile', str(log), USER],
+                                        env=env, stdout=subprocess.PIPE, stderr=stderr, timeout=3)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, b'')
+            self.assertIn(b'IsDir', stderr_path.read_bytes())
+            self.assertEqual(server.requests, [])
+
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX path limits and symlinks')
+    def test_unresolvable_logfile_path_errors_reach_regular_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = root / 'loop'
+            loop.symlink_to(loop.name)
+            oversized = root / ('x' * (os.pathconf(root, 'PC_NAME_MAX') + 1))
+            for log, error_name in ((oversized, 'NameTooLong'), (loop, 'SymLinkLoop')):
+                with self.subTest(error_name=error_name):
+                    stderr_path = root / 'stderr.txt'
+                    with stderr_path.open('wb') as stderr:
+                        result = subprocess.run([BINARY, '--no-progress', '--logfile', str(log), '--stdin'],
+                                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                stderr=stderr, timeout=3)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, b'')
+                    self.assertIn(f'open {log}: {error_name}\n'.encode(), stderr_path.read_bytes())
+
+    @unittest.skipUnless(os.name == 'posix' and os.geteuid() != 0, 'requires non-root POSIX permissions')
+    def test_logfile_access_denied_reports_to_a_pipe_and_preserves_regular_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            log = Path(tmp) / 'read-only.jsonl'
+            stderr_path = Path(tmp) / 'stderr.txt'
+            original = b'{"msg":"existing record"}\n'
+            log.write_bytes(original)
+            args = [BINARY, '--no-progress', '--logfile', str(log), USER]
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with log.open('r+b') as shared_stderr:
+                log.chmod(0o400)
+                with stderr_path.open('wb') as separate_stderr:
+                    separate = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=separate_stderr, timeout=3)
+                shared = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=shared_stderr, timeout=3)
+                piped = subprocess.run(args, env=env, capture_output=True, timeout=3)
+            self.assertEqual(separate.returncode, 1)
+            self.assertEqual(shared.returncode, 1)
+            self.assertEqual(piped.returncode, 1)
+            self.assertEqual(separate.stdout, b'')
+            self.assertEqual(shared.stdout, b'')
+            self.assertEqual(piped.stdout, b'')
+            self.assertIn(b'AccessDenied', piped.stderr)
+            self.assertEqual(stderr_path.read_bytes(), b'')
+            self.assertEqual(log.read_bytes(), original)
+            self.assertEqual(server.requests, [])
+
+    def test_incomplete_logfile_fails_before_fetch_even_with_open_stdin(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            path = Path(tmp) / 'partial.jsonl'
+            original = b'{"msg":"partial'
+            path.write_bytes(original)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with subprocess.Popen(
+                    [BINARY, '--no-progress', '--stdin', '--http-metrics', '--logfile', str(path), USER],
+                    env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                try:
+                    self.assertEqual(proc.wait(timeout=3), 1)
+                    stdout, stderr = proc.communicate(timeout=3)
+                    self.assertEqual(stdout, b'')
+                    self.assertIn(b'IncompleteLogRecord', stderr)
+                    self.assertEqual(server.requests, [])
+                    self.assertEqual(path.read_bytes(), original)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+            with path.open('r+b') as stderr, subprocess.Popen(
+                    [BINARY, '--no-progress', '--stdin', '--logfile', str(path), USER],
+                    env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr) as proc:
+                try:
+                    self.assertEqual(proc.wait(timeout=3), 1)
+                    self.assertEqual(proc.stdout.read(), b'')
+                    self.assertEqual(server.requests, [])
+                    self.assertEqual(path.read_bytes(), original)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock')
+    def test_incomplete_logfile_detected_after_startup_stops_open_stdin(self):
+        import fcntl
+        def reply(page, attempt, path):
+            return 429, b'', {'Retry-After': '0'}, False
+
+        with tempfile.TemporaryDirectory() as tmp, fixture(reply) as server:
+            path = Path(tmp) / 'partial.jsonl'
+            original = b'{"msg":"partial'
+            path.write_bytes(original)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('r+b') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                with subprocess.Popen(
+                        [BINARY, '--no-progress', '--stdin', '--http-metrics', '--logfile', str(path), USER],
+                        env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                    try:
+                        self.assertTrue(server.headers_sent.wait(3))
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        self.assertEqual(proc.wait(timeout=3), 1)
+                        _, stderr = proc.communicate(timeout=3)
+                        self.assertIn(b'IncompleteLogRecord', stderr)
+                        self.assertEqual(server.requests, [1])
+                        self.assertEqual(path.read_bytes(), original)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock')
+    def test_deferred_log_tail_check_stops_open_stdin_without_metrics(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            path = Path(tmp) / 'partial.jsonl'
+            original = b'{"msg":"partial'
+            path.write_bytes(original)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('r+b') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                with subprocess.Popen(
+                        [BINARY, '--no-progress', '--no-sort', '--stdin', '-P2', '--logfile', str(path), USER],
+                        env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                    try:
+                        self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        self.assertEqual(proc.wait(timeout=3), 1)
+                        stdout, stderr = proc.communicate(timeout=3)
+                        self.assertEqual(stdout, b'sm10\nsm2\n')
+                        self.assertIn(b'IncompleteLogRecord', stderr)
+                        self.assertEqual(server.requests, [1])
+                        self.assertEqual(path.read_bytes(), original)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+
+    @unittest.skipUnless(Path('/dev/stderr').exists(), 'requires /dev/stderr')
+    def test_logfile_and_summary_append_to_the_same_regular_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            path = Path(tmp) / 'stderr.log'
+            prefix = b'{"msg":"existing"}\n'
+            path.write_bytes(prefix)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('r+b') as stderr:
+                result = subprocess.run([BINARY, '--progress', '-P2', '--http-metrics',
+                                         '--logfile', '/dev/stderr', USER],
+                                        env=env, stdout=subprocess.PIPE, stderr=stderr, timeout=5)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b'sm2\nsm10\n')
+            self.assertTrue(path.read_bytes().startswith(prefix), path.read_bytes())
+            lines = path.read_text().splitlines()
+            self.assertEqual([json.loads(line)['msg'] for line in lines if line.startswith('{')],
+                             ['existing', 'http_attempt', 'video list', 'http_metrics'])
+            self.assertEqual(len([line for line in lines if line]), 6)
+            self.assertIn('1/1', lines)
+            self.assertTrue(any(line.startswith('summary ') for line in lines))
+
+    def test_logfile_identity_preserves_merged_output_and_inherited_offsets(self):
+        for name in ('path', 'hardlink', '/dev/stderr', '/dev/fd/2'):
+            if name.startswith('/') and not Path(name).exists():
+                continue
+            for merged in (False, True):
+                with self.subTest(path=name, merged=merged), tempfile.TemporaryDirectory() as tmp, fixture() as server:
+                    path = Path(tmp) / 'run.log'
+                    prefix = b'{"msg":"existing"}\n'
+                    path.write_bytes(prefix)
+                    target = path if name == 'path' else Path(name)
+                    if name == 'hardlink':
+                        target = Path(tmp) / 'alias.log'
+                        os.link(path, target)
+                    env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+                    with path.open('r+b', buffering=0) as stderr:
+                        result = subprocess.run([BINARY, '--no-progress', '-P2', '--http-metrics',
+                                                 '--logfile', str(target), USER],
+                                                env=env, stdout=stderr if merged else subprocess.PIPE,
+                                                stderr=stderr, timeout=5)
+                        self.assertEqual(result.returncode, 0)
+                        if not merged:
+                            self.assertEqual(result.stdout, b'sm2\nsm10\n')
+                        stderr.write(b'parent stderr\n')
+                    lines = path.read_bytes().splitlines()
+                    self.assertEqual(lines[0], prefix.rstrip(b'\n'))
+                    self.assertEqual(lines[-1], b'parent stderr')
+                    records = [json.loads(line)['msg'] for line in lines if line.startswith(b'{')]
+                    self.assertEqual(records, ['existing', 'http_attempt', 'video list', 'http_metrics'])
+                    summary = next(i for i, line in enumerate(lines) if line.startswith(b'summary '))
+                    metrics = next(i for i, line in enumerate(lines) if b'"msg":"http_metrics"' in line)
+                    self.assertLess(summary, metrics)
+                    self.assertEqual([line for line in lines if line in (b'sm2', b'sm10')],
+                                     [b'sm2', b'sm10'] if merged else [])
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate file lock and SIGTERM')
+    def test_sigterm_offset_sync_falls_back_without_waiting_for_the_logfile_lock(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp, fixture(
+                lambda *_: (429, b'', {'Retry-After': '15'}, False)) as server:
+            path = Path(tmp) / 'run.log'
+            prefix = b'{"msg":"previous"}\n'
+            path.write_bytes(prefix)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('r+b', buffering=0) as stderr, path.open('r+b') as lock_file:
+                stderr.seek(0, os.SEEK_END)
+                with subprocess.Popen(
+                        [BINARY, '--no-progress', '--http-metrics', '--logfile', str(path), USER],
+                        stdout=subprocess.PIPE, stderr=stderr, env=env) as proc:
+                    try:
+                        until = time.monotonic() + 3
+                        while b'HTTP attempt returned error status' not in path.read_bytes() and time.monotonic() < until:
+                            time.sleep(.01)
+                        self.assertIn(b'HTTP attempt returned error status', path.read_bytes())
+                        fcntl.flock(lock_file, fcntl.LOCK_EX)
+                        before = path.read_bytes()
+                        proc.send_signal(signal.SIGTERM)
+                        self.assertEqual(proc.wait(timeout=3), 1)
+                        self.assertEqual(stderr.tell(), len(before))
+                        stderr.write(b'parent after wait\n')
+                        self.assertEqual(path.read_bytes(), before + b'parent after wait\n')
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a full pipe and SIGTERM')
+    def test_summary_flush_precedes_metrics_in_a_separate_logfile(self):
+        with fixture() as server, tempfile.TemporaryDirectory() as tmp, full_pipe() as stderr:
+            path = Path(tmp) / 'metrics.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with subprocess.Popen(
+                    [BINARY, '--no-progress', '-P2', '--http-metrics', '--logfile', str(path), USER],
+                    stdout=subprocess.PIPE, stderr=stderr, env=env) as proc:
+                try:
+                    self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                    until = time.monotonic() + 3
+                    while b'"msg":"video list"' not in path.read_bytes() and time.monotonic() < until:
+                        time.sleep(.01)
+                    self.assertIn(b'"msg":"video list"', path.read_bytes())
+                    time.sleep(.15)
+                    self.assertNotIn(b'"msg":"http_metrics"', path.read_bytes())
+                    proc.send_signal(signal.SIGTERM)
+                    self.assertEqual(proc.wait(timeout=3), 1)
+                    self.assertEqual(proc.stdout.read(), b'sm2\nsm10\n')
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+
+    def test_concurrent_logfile_writers_append_complete_records(self):
+        both_open = threading.Event()
+
+        def reply(page, attempt, path):
+            if attempt == 2:
+                both_open.set()
+            return 200, body(('sm1',)), {}, True
+
+        invalid = ['a' * 12000, 'b' * 14000]
+        with fixture(reply) as server, tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            path = Path(tmp) / 'shared.jsonl'
+            path.write_bytes(b'{"msg":"existing"}\n')
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            procs = [stack.enter_context(subprocess.Popen(
+                [BINARY, '--stdin', '--no-progress', '-P2', '--http-metrics', '--logfile', str(path)],
+                env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+                for _ in invalid]
+            try:
+                for proc in procs:
+                    proc.stdin.write(USER.encode() + b'\n')
+                    proc.stdin.flush()
+                self.assertTrue(both_open.wait(5), 'both clients must open the log before fetching')
+                self.assertEqual(path.read_bytes(), b'{"msg":"existing"}\n')
+                server.release.set()
+                for proc, line in zip(procs, invalid):
+                    stdout, stderr = proc.communicate(line.encode() + b'\n', timeout=5)
+                    self.assertEqual(proc.returncode, 0, stderr)
+                    self.assertEqual(stdout, b'sm1\n')
+            finally:
+                for proc in procs:
+                    if proc.poll() is None:
+                        proc.kill()
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(rows[0], {'msg': 'existing'})
+            self.assertCountEqual([row['msg'] for row in rows[1:]],
+                                  ['invalid input', 'http_attempt', 'video list', 'http_metrics'] * 2)
+            self.assertCountEqual([row['input'] for row in rows if 'input' in row], invalid)
+
+    def test_input_preserves_invalid_utf8_next_to_unicode_space(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            path = Path(tmp) / 'input.txt'
+            nel = '\u0085'.encode()
+            path.write_bytes(nel + b'\x85' + nel + b'\n' + nel + USER.encode() + nel + b'\n')
+            result = command(server, '-P2', '--input-file', str(path), '--json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output['items'], ['sm2', 'sm10'])
+            self.assertEqual(output['invalid'], ['\ufffd'])
+            self.assertIn('inputs=2 valid=1 invalid=1', result.stderr)
+
+    def test_terminal_empty_page_cancels_later_retry_after(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'attempts.jsonl'
+
+            def reply(page, *_):
+                if page == 1:
+                    return 200, body(('sm1',), total=300), {}, False
+                if page == 3:
+                    return 429, b'', {'Retry-After': '30'}, False
+                # Withhold page 2 until the client has processed page 3's 429.
+                until = time.monotonic() + 3
+                while time.monotonic() < until:
+                    with path.open('rb') as attempt_log:
+                        # Windows locks the first byte while another process appends.
+                        attempt_log.seek(1)
+                        if b'"status":429' in attempt_log.read():
+                            return 200, body((), total=300), {}, False
+                    time.sleep(.01)
+                return 500, b'', {}, False
+
+            with fixture(reply) as server:
+                result = command(server, '-P3', '-H3', '--timeout', '5s',
+                                 '--logfile', str(path), '--http-metrics', '--json', USER,
+                                 process_timeout=4)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = json.loads(result.stdout)
+                self.assertEqual(output['items'], ['sm1'])
+                self.assertEqual(output['targets'][0]['error'], '')
+                self.assertCountEqual(server.requests, [1, 2, 3])
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                self.assertTrue(any(row.get('attempt', {}).get('status') == 429 for row in rows))
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock')
+    def test_terminal_empty_page_cancels_later_retry_when_log_is_locked(self):
+        import fcntl
+        third_requested = threading.Event()
+        finish_second = threading.Event()
+
+        def reply(page, attempt, path):
+            if page == 1:
+                return 200, body(('sm1',), total=300), {}, False
+            if page == 2:
+                finish_second.wait(5)
+                return 200, body((), total=300), {}, False
+            if third_requested.is_set():
+                return 404, b'', {}, False
+            third_requested.set()
+            return 429, b'', {'Retry-After': '2'}, False
+
+        with tempfile.TemporaryDirectory() as tmp, fixture(reply) as server:
+            path = Path(tmp) / 'locked.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('wb') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                with subprocess.Popen(
+                        [BINARY, '--no-progress', '-P3', '-H3', '--retries', '2', '--timeout', '5s',
+                         '--logfile', str(path), '--json', USER],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                    try:
+                        self.assertTrue(third_requested.wait(3))
+                        # Give the 429 worker time to reach the blocked diagnostic append.
+                        time.sleep(.2)
+                        self.assertEqual(path.stat().st_size, 0)
+                        finish_second.set()
+                        # Stdout can finish while the final report still waits for the lock.
+                        ready_before_unlock = bool(select.select([proc.stdout], [], [], 1)[0])
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        stdout, stderr = proc.communicate(timeout=5)
+                        self.assertEqual(proc.returncode, 0, stderr)
+                        self.assertEqual(json.loads(stdout)['items'], ['sm1'])
+                        self.assertCountEqual(server.requests, [1, 2, 3])
+                        self.assertTrue(ready_before_unlock, 'output waited on the discarded page')
+                    finally:
+                        finish_second.set()
+                        if proc.poll() is None:
+                            proc.kill()
+
+    def test_timeout_trace_precedes_an_earlier_pages_retry(self):
+        second_retried = threading.Event()
+        second_started = threading.Event()
+        third_started = threading.Event()
+
+        def reply(page, *_):
+            if page == 1:
+                return 200, body(('sm1',), total=300), {}, False
+            if page == 3:
+                third_started.set()
+                return 200, body(('sm3',), total=300), {}, True
+            if second_started.is_set():
+                second_retried.set()
+                return 200, body(('sm2',), total=300), {}, False
+            second_started.set()
+            return 429, b'', {'Retry-After': '2'}, False
+
+        with tempfile.TemporaryDirectory() as tmp, fixture(reply) as server:
+            path = Path(tmp) / 'timeouts.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with subprocess.Popen(
+                    [BINARY, '--no-progress', '-P3', '-H3', '--retries', '2', '--timeout', '250ms',
+                     '--http-metrics', '--logfile', str(path), '--json', USER],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                try:
+                    self.assertTrue(second_started.wait(3))
+                    self.assertTrue(third_started.wait(3))
+                    early_trace = False
+                    until = time.monotonic() + 3
+                    while not second_retried.is_set() and time.monotonic() < until:
+                        with path.open('rb') as logs:
+                            logs.seek(1)  # Avoid the first-byte lock on Windows.
+                            early_trace = any(b'"page":3' in line and b'"error_name":"Timeout"' in line
+                                              for line in logs)
+                        if early_trace:
+                            break
+                        time.sleep(.01)
+                    stdout, stderr = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, 1, stderr)
+                    self.assertEqual(json.loads(stdout)['items'], ['sm1', 'sm2'])
+                    self.assertTrue(second_retried.is_set())
+                    self.assertTrue(early_trace, 'page 3 diagnostics waited for page 2 to retry')
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock and SIGTERM')
+    def test_sigterm_keeps_a_completed_no_sort_result_while_diagnostics_wait(self):
+        import fcntl
+        let_success_finish = threading.Event()
+        success_requested = threading.Event()
+
+        def reply(page, attempt, path):
+            if '/users/2/' in path:
+                success_requested.set()
+                let_success_finish.wait(5)
+                return 200, body(('sm2',)), {}, False
+            return 200, body(('sm1',)), {}, True
+
+        with tempfile.TemporaryDirectory() as tmp, fixture(reply) as server:
+            path = Path(tmp) / 'locked.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('wb') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                with subprocess.Popen(
+                        [BINARY, '--stdin', '--no-progress', '--no-sort', '--best-effort',
+                         '-T2', '-P2', '--timeout', '1s', '--logfile', str(path), USER],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                    try:
+                        self.assertTrue(server.headers_sent.wait(3))
+                        time.sleep(.55)
+                        proc.stdin.write(b'https://www.nicovideo.jp/user/2\n')
+                        proc.stdin.flush()
+                        self.assertTrue(success_requested.wait(2))
+                        # Target 1 times out and waits on the log. Target 2 can
+                        # finish on its own socket with the same request timeout.
+                        time.sleep(.55)
+                        let_success_finish.set()
+                        time.sleep(.18)
+                        proc.send_signal(signal.SIGTERM)
+                        # Stdout should finish before the locked final report.
+                        self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        stdout, stderr = proc.communicate(timeout=5)
+                        self.assertEqual(stdout, b'sm2\n')
+                        self.assertEqual(proc.returncode, 0, stderr)
+                        self.assertIn(b'fetch_ok=1 fetch_err=1 output_count=1', stderr)
+                    finally:
+                        let_success_finish.set()
+                        if proc.poll() is None:
+                            proc.kill()
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock and SIGTERM')
+    def test_sigterm_retries_pending_terminal_diagnostics_in_the_final_report(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp, fixture(
+                lambda *_: (200, body(), {}, True)) as server:
+            path = Path(tmp) / 'locked.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('wb') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                with subprocess.Popen(
+                        [BINARY, '--no-progress', '--json', '--best-effort', '--http-metrics',
+                         '--timeout', '250ms', '--logfile', str(path), USER],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                    try:
+                        self.assertTrue(server.headers_sent.wait(3))
+                        time.sleep(.45)
+                        self.assertEqual(path.stat().st_size, 0)
+                        proc.send_signal(signal.SIGTERM)
+                        self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        _, stderr = proc.communicate(timeout=5)
+                        self.assertEqual(proc.returncode, 0, stderr)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(sum(row.get('error') == 'Timeout' and
+                                 row['msg'] == 'failed to read response body' for row in records), 1)
+            self.assertEqual(sum(row.get('attempt', {}).get('error_name') == 'Timeout'
+                                 for row in records), 1)
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock and SIGTERM')
+    def test_sigterm_retries_unsent_http_attempts_once(self):
+        import fcntl
+        for status in (200, 429):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp, fixture(
+                    lambda *_: (status, body() if status == 200 else b'',
+                                {'Retry-After': '10'} if status == 429 else {}, False)) as server:
+                path = Path(tmp) / 'locked.jsonl'
+                env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+                with path.open('wb') as lock_file:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX)
+                    with subprocess.Popen(
+                            [BINARY, '--no-progress', '--json', '--http-metrics',
+                             '--timeout', '2s', '--logfile', str(path), USER],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                        try:
+                            self.assertTrue(server.headers_sent.wait(3))
+                            time.sleep(.15)
+                            self.assertEqual(path.stat().st_size, 0)
+                            proc.send_signal(signal.SIGTERM)
+                            self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                            fcntl.flock(lock_file, fcntl.LOCK_UN)
+                            stdout, stderr = proc.communicate(timeout=5)
+                            self.assertEqual(proc.returncode, 0, stderr)
+                            json.loads(stdout)
+                            self.assertEqual(server.requests, [1])
+                        finally:
+                            if proc.poll() is None:
+                                proc.kill()
+                records = [json.loads(line) for line in path.read_text().splitlines()]
+                self.assertEqual([(row['attempt']['request_id'], row['attempt']['status'])
+                                  for row in records if row['msg'] == 'http_attempt'], [(1, status)])
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX graceful SIGTERM test')
+    def test_sigterm_cancels_inflight_diagnostics_with_full_stderr(self):
+        for mode in ('body', '429 metrics', '429 metrics and body deadline'):
+            with self.subTest(mode=mode):
+                def reply(page, attempt, path):
+                    if mode == '429 metrics' or '/users/2/' in path:
+                        return 429, b'', {'Retry-After': '20'}, False
+                    return 200, body(), {}, True
+
+                with fixture(reply) as server, full_pipe() as stderr:
+                    mixed = mode == '429 metrics and body deadline'
+                    env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+                    args = [BINARY, '--no-progress', '--http-metrics',
+                            '--timeout', '300ms' if mixed else '5s', USER]
+                    if mixed:
+                        args.append('https://www.nicovideo.jp/user/2')
+                    with subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=stderr) as proc:
+                        try:
+                            self.assertTrue(server.headers_sent.wait(3))
+                            if mixed:
+                                until = time.monotonic() + 3
+                                while len(server.requests) < 2 and time.monotonic() < until:
+                                    time.sleep(.01)
+                                self.assertEqual(len(server.requests), 2)
+                            time.sleep(.5 if mixed else .15)
+                            self.assertIsNone(proc.poll())
+                            proc.send_signal(signal.SIGTERM)
+                            self.assertEqual(proc.wait(timeout=3), 1)
+                            self.assertEqual(len(server.requests), 2 if mixed else 1)
+                        finally:
+                            if proc.poll() is None:
+                                proc.kill()
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX graceful SIGTERM test')
+    def test_sigterm_cancels_final_flush_of_full_stderr(self):
+        for logfile in (False, True):
+            with self.subTest(logfile=logfile), fixture() as server, tempfile.TemporaryDirectory() as tmp, full_pipe() as stderr:
+                env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+                args = ['--logfile', str(Path(tmp) / 'run.jsonl')] if logfile else []
+                with subprocess.Popen([BINARY, '--no-progress', '-P2', *args, USER],
+                                      env=env, stdout=subprocess.PIPE, stderr=stderr) as proc:
+                    try:
+                        self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            proc.wait(timeout=.1)
+                        proc.send_signal(signal.SIGTERM)
+                        self.assertEqual(proc.wait(timeout=3), 1)
+                        self.assertEqual(proc.stdout.read(), b'sm2\nsm10\n')
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+
     def test_scheduler_terminal_and_deadline_regressions(self):
         for mode in ('earlier_empty', 'earlier_404', 'earlier_error', 'short_deadline',
                      'adaptive_timeout_headers', 'adaptive_timeout_body'):
@@ -590,7 +1458,6 @@ class CliIntegration(unittest.TestCase):
                 # Wait until the handler is certainly installed by sending a valid target
                 # and observing its HTTP request, while keeping stdin open.
                 proc.stdin.write(USER + '\n'); proc.stdin.flush()
-                import time
                 deadline = time.monotonic() + 5
                 while not server.requests and time.monotonic() < deadline:
                     time.sleep(.01)

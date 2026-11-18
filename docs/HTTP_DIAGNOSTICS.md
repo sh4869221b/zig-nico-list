@@ -80,7 +80,16 @@ attempt numbers, and an invocation-local unique `request_id` (dispatch order).
   `response_200_heads` and `http_403` count received heads even if a later body
   timeout changes the outcome. `http_403` overlaps `http_other` in normal cases.
   `timeouts`, `cancellations`, and `body_errors` distinguish failure causes.
-  Existing `body_bytes` counts retained complete bodies, not partial failed reads.
+  `body_bytes` counts complete bodies retained for JSON parsing, after
+  decompression when applicable.
+  The output task can emit timeout diagnostics while an earlier page is
+  still retrying. The final report resumes pending records, including
+  ordinary attempt traces whose write was interrupted. Streams resume at the
+  first unsent byte. Regular logfiles roll back a verified partial append
+  before releasing the lock and reject an unterminated tail before appending.
+  The final report flushes the
+  summary before sending aggregate HTTP metrics, including when the two
+  use different streams. Use `request_id` to correlate attempt records.
 - `service_ns` and all phase timings sum concurrent attempt durations, so they
   can exceed wall time. Semaphore/rate/backoff remain separate aggregate fields;
   `backoff_wait_ns` is scheduled retry delay, not measured sleep or shared cooldown.
@@ -234,11 +243,10 @@ occurred in the user's Windows runs.
 
 Failed header parsing, unsupported response encoding, invalid/missing redirect
 locations, and other unrecoverable head errors mark the connection closing
-before cleanup. Invalid redirect destinations are checked before reading a
-redirect body. A peer that withholds a rejected response's body therefore cannot
-turn the original error into a cleanup-induced timeout or return that socket to
-the pool. Normal transport retry/backoff and successful redirect-body handling
-remain in effect.
+before cleanup. The client follows a valid redirect as soon as it reads the
+response head. It can reuse the redirect connection when the body is explicitly
+empty and the connection permits keep-alive. Other redirect connections are
+closed immediately.
 
 Status codes must contain three decimal digits. Informational responses such as
 102 and 103 are followed by the final response within the same attempt deadline.

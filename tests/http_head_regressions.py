@@ -78,11 +78,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             n = len(server.requests)
         mode = server.mode
         try:
-            if mode in ('redirect_close_delimited', 'redirect_truncated'):
+            if mode in ('redirect_close_delimited', 'redirect_truncated', 'redirect_stalled_body',
+                        'redirect_stalled_chunked', 'redirect_stalled_close_delimited', 'redirect_empty'):
                 if n == 1:
                     headers = [(b'Location', b'/redirected')]
-                    if mode == 'redirect_truncated':
+                    if mode == 'redirect_empty':
+                        self.write(response(b'302 Found', headers + [(b'Content-Length', b'0')]))
+                        return
+                    if mode == 'redirect_stalled_chunked':
+                        self.stall(response(b'302 Found', headers + [(b'Transfer-Encoding', b'chunked')]))
+                        return
+                    if mode in ('redirect_truncated', 'redirect_stalled_body'):
                         headers.append((b'Content-Length', b'100'))
+                    if mode in ('redirect_stalled_body', 'redirect_stalled_close_delimited'):
+                        self.stall(response(b'302 Found', headers, body=b'prefix'))
+                        return
                     self.write(response(b'302 Found', headers, body=b'prefix'))
                     self.close_connection = True
                     self.connection.shutdown(socket.SHUT_RDWR)
@@ -274,6 +284,18 @@ class HttpHeadTests(unittest.TestCase):
                 self.assertEqual(result['metrics']['transport_errors'], 0, result)
                 self.assertEqual(result['metrics']['transport_replays'], 0, result)
                 self.assertEqual(result['metrics']['retries'], 0, result)
+
+    def test_redirect_follows_before_body_and_preserves_empty_keep_alive(self):
+        for mode in ('redirect_stalled_body', 'redirect_stalled_chunked',
+                     'redirect_stalled_close_delimited', 'redirect_empty'):
+            with self.subTest(mode=mode):
+                result = run(self.binary, mode)
+                self.assertEqual(result['exit'], 0, result)
+                self.assertEqual(result['output']['items'], ['sm1'], result)
+                self.assertEqual(len(result['requests']), 2, result)
+                self.assertEqual(result['requests'][0] == result['requests'][1],
+                                 mode == 'redirect_empty', result)
+                self.assertEqual(result['metrics']['attempts'], 1, result)
 
     def test_overlong_redirect_credentials_reject_without_draining_or_retrying(self):
         result = run(self.binary, 'overlong_redirect_auth', retries=3)

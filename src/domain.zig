@@ -14,14 +14,17 @@ pub var canceled: std.atomic.Value(bool) = .init(false);
 pub fn now(io: Io) i64 {
     return @intCast(Io.Timestamp.now(io, .awake).toNanoseconds());
 }
-pub fn check(io: Io) !void {
-    if (canceled.load(.acquire)) return error.Canceled;
+fn isAborted(deadline: ?*const Deadline) bool {
+    return canceled.load(.acquire) or if (deadline) |owner| owner.aborted.load(.acquire) else false;
+}
+pub fn check(io: Io, deadline: ?*const Deadline) !void {
+    if (isAborted(deadline)) return error.Canceled;
     try io.checkCancel();
 }
-pub fn sleep(io: Io, ns: i64) !void {
+fn sleep(io: Io, ns: i64, deadline: ?*const Deadline) !void {
     const until = now(io) +| @max(0, ns);
     while (true) {
-        try check(io);
+        try check(io, deadline);
         const remaining = until - now(io);
         if (remaining <= 0) return;
         try io.sleep(.fromNanoseconds(@min(remaining, 20_000_000)), .awake);
@@ -185,7 +188,7 @@ pub const Control = struct {
         if (waiter.next) |p| p.prev = waiter.prev else self.tail = waiter.prev;
         self.pending -= 1;
     }
-    fn acquire(self: *Control) !void {
+    fn acquire(self: *Control, deadline: ?*const Deadline) !void {
         const started = now(self.io);
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
@@ -199,7 +202,7 @@ pub const Control = struct {
             self.changed.broadcast(self.io);
         }
         while (true) {
-            try check(self.io);
+            try check(self.io, deadline);
             const limit = self.httpLimit();
             if (self.head == &waiter and (limit == 0 or self.reserved < limit)) break;
             self.changed.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch |err| if (err != error.Timeout) return err;
@@ -214,9 +217,9 @@ pub const Control = struct {
         self.reserved -= 1;
         self.changed.broadcast(self.io);
     }
-    fn rateWait(self: *Control) !i64 {
+    fn rateWait(self: *Control, deadline: ?*const Deadline) !i64 {
+        try check(self.io, deadline);
         if (self.interval <= 0) {
-            try check(self.io);
             return 0;
         }
         const started = now(self.io);
@@ -224,17 +227,18 @@ pub const Control = struct {
         const ready = @max(started, self.rate_next);
         self.rate_next = ready +| self.interval;
         self.mutex.unlock(self.io);
-        try sleep(self.io, ready - started);
+        try sleep(self.io, ready - started, deadline);
         return now(self.io) - started;
     }
-    fn waitReady(self: *Control, retry_at: i64) !void {
+    fn waitReady(self: *Control, retry_at: i64, deadline: ?*const Deadline) !void {
         while (true) {
+            try check(self.io, deadline);
             self.mutex.lockUncancelable(self.io);
             const ready = @max(retry_at, if (self.cfg.concurrency_adaptive) self.controller.readyAt() else 0);
             self.mutex.unlock(self.io);
             const delay = ready - now(self.io);
             if (delay <= 0) return;
-            try sleep(self.io, delay);
+            try sleep(self.io, delay, deadline);
         }
     }
 };
@@ -286,11 +290,18 @@ pub const Context = struct {
     deadline: ?*Deadline = null,
     target_sequence: usize = 0,
     trace_fn: ?*const fn (?*anyopaque, AttemptTrace) void = null,
+    terminal_diagnostic_fn: ?*const fn (?*anyopaque, TerminalDiagnostic) void = null,
     log_context: ?*anyopaque = null,
     log_fn: ?*const fn (?*anyopaque, []const u8, []const u8, []const u8) void = null,
     fn log(self: *Context, level: []const u8, message: []const u8, detail: []const u8) void {
+        if (isAborted(self.deadline)) return;
         if (self.log_fn) |f| f(self.log_context, level, message, detail);
     }
+};
+
+pub const TerminalDiagnostic = struct {
+    body_error: ?[]const u8,
+    trace: ?AttemptTrace,
 };
 
 const Response = struct { status: u16, body: []u8, retry_after: i64 = 0, body_error: ?anyerror = null };
@@ -324,7 +335,13 @@ pub const AttemptTrace = struct {
     adaptive_prior_decision: ?adaptive.Decision = null,
     adaptive_decision: ?adaptive.Decision = null,
 };
-const Attempt = struct { generation: u64, index: i64, retry_at: i64 = 0, trace: AttemptTrace = .{} };
+const Attempt = struct {
+    generation: u64,
+    index: i64,
+    retry_at: i64 = 0,
+    interrupted_body_read: bool = false,
+    trace: AttemptTrace = .{},
+};
 fn requestRaw(ctx: *Context, url: []const u8, attempt_info: *Attempt) anyerror!Response {
     return requestOnce(ctx, url, attempt_info, false) catch |err| {
         if (err != error.StalePooledConnection) return err;
@@ -333,7 +350,7 @@ fn requestRaw(ctx: *Context, url: []const u8, attempt_info: *Attempt) anyerror!R
         // cancellation signal. The replay shares the original attempt deadline.
         const deadline = ctx.deadline orelse return error.MissingDeadlineOwner;
         try deadline.requireActive(now(ctx.io));
-        try check(ctx.io);
+        try check(ctx.io, ctx.deadline);
         const trace = &attempt_info.trace;
         const first = trace.*;
         trace.acquire_ns = 0;
@@ -383,7 +400,6 @@ fn requestOnce(ctx: *Context, url: []const u8, attempt_info: *Attempt, fresh: bo
     var req = ctx.client.request(.GET, uri, .{
         .connection = pooled,
         .force_new_connection = fresh,
-        .headers = .{ .accept_encoding = .omit },
         .extra_headers = &.{ .{ .name = "X-Frontend-Id", .value = "6" }, .{ .name = "Accept", .value = "*/*" } },
         .redirect_behavior = .init(10),
     }) catch |err| {
@@ -398,6 +414,7 @@ fn requestOnce(ctx: *Context, url: []const u8, attempt_info: *Attempt, fresh: bo
     trace.acquire_ns = now(ctx.io) - phase_started;
     trace.phase = .send;
     phase_started = now(ctx.io);
+    try check(ctx.io, ctx.deadline);
     try req.sendBodiless();
     trace.send_ns = now(ctx.io) - phase_started;
     trace.phase = .head;
@@ -446,8 +463,7 @@ fn requestOnce(ctx: *Context, url: []const u8, attempt_info: *Attempt, fresh: bo
     }
     trace.phase = .body;
     phase_started = now(ctx.io);
-    var transfer: [16384]u8 = undefined;
-    const body = res.reader(&transfer).allocRemaining(ctx.temporary, .limited(max_page_body_bytes)) catch |err| {
+    const body = readPageBody(ctx.temporary, &res) catch |err| {
         // Never drain or reuse a response rejected before its framing ends.
         if (req.connection) |connection| connection.closing = true;
         return .{
@@ -456,20 +472,81 @@ fn requestOnce(ctx: *Context, url: []const u8, attempt_info: *Attempt, fresh: bo
             .body_error = if (err == error.StreamTooLong) error.ResponseBodyTooLarge else err,
         };
     };
-    // allocRemaining accepts EOF, including a premature EOF from Zig's HTTP
-    // body reader. Do not accept a valid JSON prefix until HTTP framing ends.
-    switch (req.reader.state) {
-        .body_remaining_content_length, .body_remaining_chunk_len => {
-            ctx.temporary.free(body);
-            return .{ .status = status, .body = try ctx.temporary.alloc(u8, 0), .body_error = error.TruncatedResponseBody };
-        },
-        else => {}, // EOF is the delimiter for body_none.
-    }
     trace.body_ns = now(ctx.io) - phase_started;
     trace.phase = .complete;
     return .{ .status = status, .body = body, .retry_after = retry_after };
 }
+
+fn readPageBody(allocator: Allocator, response: *HttpClient.Response) ![]u8 {
+    const encoding = response.head.content_encoding;
+    var transfer: [16384]u8 = undefined;
+    const wire = response.reader(&transfer);
+    const body = switch (encoding) {
+        .identity => try wire.allocRemaining(allocator, .limited(max_page_body_bytes)),
+        .gzip => try readCompressedPageBody(allocator, wire, .gzip),
+        .deflate => try readCompressedPageBody(allocator, wire, .zlib),
+        else => return error.HttpContentEncodingUnsupported,
+    };
+    errdefer allocator.free(body);
+    // The HTTP reader can return EOF before the declared Content-Length.
+    return switch (response.request.reader.state) {
+        .ready, .body_none => body,
+        else => error.TruncatedResponseBody,
+    };
+}
+
+fn readCompressedPageBody(allocator: Allocator, wire: *Io.Reader, container: std.compress.flate.Container) ![]u8 {
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    while (true) {
+        try validateCompressionHeader(wire, container);
+        const member_start = decoded.items.len;
+        var decoder: std.compress.flate.Decompress = .init(wire, container, &window);
+        decoder.reader.appendRemaining(allocator, &decoded, .limited(max_page_body_bytes + 1 - member_start)) catch |err| {
+            if (err == error.ReadFailed and decoder.err != null and decoder.err.? != error.ReadFailed)
+                return error.InvalidCompressedResponseBody;
+            return err;
+        };
+        // Zig exposes the footer but leaves validation to callers.
+        const member = decoded.items[member_start..];
+        const valid = switch (decoder.container_metadata) {
+            .gzip => |footer| footer.count == member.len and footer.crc == std.hash.Crc32.hash(member),
+            .zlib => |footer| footer.adler == std.hash.Adler32.hash(member),
+            .raw => unreachable,
+        };
+        if (!valid) return error.InvalidCompressedResponseBody;
+
+        // Reading through the framing terminator also consumes chunked trailers.
+        _ = wire.peekByte() catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        // A gzip stream may contain several members. Deflate carries one zlib stream.
+        if (container != .gzip) return error.InvalidCompressedResponseBody;
+    }
+    return decoded.toOwnedSlice(allocator);
+}
+
+fn validateCompressionHeader(wire: *Io.Reader, container: std.compress.flate.Container) !void {
+    // The decoder checks the magic, method and window size. Validate the
+    // remaining mandatory header fields before it consumes the member.
+    const header = wire.peek(if (container == .gzip) 10 else 2) catch |err| switch (err) {
+        error.EndOfStream => return error.InvalidCompressedResponseBody,
+        error.ReadFailed => return error.ReadFailed,
+    };
+    const valid = switch (container) {
+        .gzip => header[3] & 0xe0 == 0,
+        // RFC 1950 requires FCHECK and forbids FDICT when the enclosing
+        // format does not specify a preset dictionary.
+        .zlib => header[1] & 0x20 == 0 and std.mem.readInt(u16, header[0..2], .big) % 31 == 0,
+        .raw => unreachable,
+    };
+    if (!valid) return error.InvalidCompressedResponseBody;
+}
+
 fn requestTimed(ctx: *Context, url: []const u8, attempt_info: *Attempt) !Response {
+    try check(ctx.io, ctx.deadline);
     const deadline = ctx.deadline orelse return error.MissingDeadlineOwner;
     const expires = now(ctx.io) +| ctx.cfg.timeout_ns;
     deadline.start(expires);
@@ -485,10 +562,7 @@ fn requestTimed(ctx: *Context, url: []const u8, attempt_info: *Attempt) !Respons
     const outcome = deadline.complete(expires, now(ctx.io));
     if (outcome != .completed) {
         if (response) |value| {
-            // Preserve a failed body-read diagnostic even when the deadline
-            // owner must replace std.http's wrapped error with its cause.
-            if (value.body_error != null)
-                ctx.log("ERROR", "failed to read response body", if (outcome == .expired) "Timeout" else "Canceled");
+            attempt_info.interrupted_body_read = value.body_error != null;
             ctx.temporary.free(value.body);
         } else |_| {}
         // Client timeouts are overload feedback. Only caller cancellation is
@@ -499,29 +573,52 @@ fn requestTimed(ctx: *Context, url: []const u8, attempt_info: *Attempt) !Respons
 }
 
 pub fn retryAfter(io: Io, raw: []const u8) i64 {
-    const value = std.mem.trim(u8, raw, " \t\r\n");
-    if (std.fmt.parseInt(i64, value, 10)) |seconds| return @max(0, seconds) *| 1_000_000_000 else |_| {}
-    // RFC 7231 IMF-fixdate. Obsolete HTTP-date variants are also accepted below.
+    const value = std.mem.trim(u8, raw, " \t");
+    if (isDecimal(value)) {
+        const seconds = std.fmt.parseInt(i64, value, 10) catch return 0;
+        return seconds *| 1_000_000_000;
+    }
     const ts = parseHTTPDate(value) catch return 0;
     const real: i64 = @intCast(Io.Timestamp.now(io, .real).toNanoseconds());
     return @max(0, ts *| 1_000_000_000 -| real);
 }
+
+fn isDecimal(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
 fn parseHTTPDate(value: []const u8) !i64 {
-    // IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
-    var words = std.mem.tokenizeAny(u8, value, " ,-");
-    _ = words.next() orelse return error.InvalidDate;
-    var day = words.next() orelse return error.InvalidDate;
-    var month = words.next() orelse return error.InvalidDate;
-    var year = words.next() orelse return error.InvalidDate;
-    var time = words.next() orelse return error.InvalidDate;
-    if (std.ascii.isAlphabetic(day[0])) {
-        const old_month = day;
-        day = month;
-        month = old_month;
-        const old_time = year;
-        year = time;
-        time = old_time;
+    const ShortDay = enum { Mon, Tue, Wed, Thu, Fri, Sat, Sun };
+    const LongDay = enum { Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday };
+    if (std.mem.indexOfScalar(u8, value, ',')) |comma| {
+        const weekday = value[0..comma];
+        const rest = value[comma + 1 ..];
+        if (!std.mem.endsWith(u8, rest, " GMT")) return error.InvalidDate;
+
+        // IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
+        if (std.meta.stringToEnum(ShortDay, weekday)) |day| {
+            if (rest.len != 25 or rest[0] != ' ' or rest[3] != ' ' or rest[7] != ' ' or rest[12] != ' ')
+                return error.InvalidDate;
+            return parseHTTPDateFields(@backingInt(day), rest[1..3], rest[4..7], rest[8..12], rest[13..21]);
+        }
+        // RFC 850: Sunday, 06-Nov-94 08:49:37 GMT
+        if (rest.len != 23 or rest[0] != ' ' or rest[3] != '-' or rest[7] != '-' or rest[10] != ' ')
+            return error.InvalidDate;
+        const day = std.meta.stringToEnum(LongDay, weekday) orelse return error.InvalidDate;
+        return parseHTTPDateFields(@backingInt(day), rest[1..3], rest[4..7], rest[8..10], rest[11..19]);
     }
+
+    // asctime: Sun Nov  6 08:49:37 1994
+    if (value.len != 24 or value[3] != ' ' or value[7] != ' ' or value[10] != ' ' or value[19] != ' ')
+        return error.InvalidDate;
+    const day = std.meta.stringToEnum(ShortDay, value[0..3]) orelse return error.InvalidDate;
+    return parseHTTPDateFields(@backingInt(day), if (value[8] == ' ') value[9..10] else value[8..10], value[4..7], value[20..24], value[11..19]);
+}
+
+fn parseHTTPDateFields(weekday: u3, day: []const u8, month: []const u8, year: []const u8, time: []const u8) !i64 {
+    if (!isDecimal(day) or !isDecimal(year) or time[2] != ':' or time[5] != ':') return error.InvalidDate;
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     var month_no: usize = 0;
     for (months, 1..) |m, i| if (std.mem.eql(u8, m, month)) {
@@ -533,7 +630,10 @@ fn parseHTTPDate(value: []const u8) !i64 {
     if (year.len == 2) year_no += if (year_no >= 69) @as(u16, 1900) else 2000;
     var tmp: [64]u8 = undefined;
     const iso = try std.fmt.bufPrint(&tmp, "{d:0>4}-{d:0>2}-{d:0>2}T{s}Z", .{ year_no, month_no, try std.fmt.parseInt(u8, day, 10), time });
-    return date_time.parseTimestamp(iso);
+    const timestamp = try date_time.parseTimestamp(iso);
+    // The Unix epoch was a Thursday, index 3 with Monday as index 0.
+    if (@mod(@divFloor(timestamp, std.time.s_per_day) + 3, 7) != weekday) return error.InvalidDate;
+    return timestamp;
 }
 
 fn retryDelay(attempt_index: i64) i64 {
@@ -564,19 +664,18 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
     var accumulated_rate: i64 = 0;
     var retry_cause: @FieldType(AttemptTrace, "retry_cause") = .none;
     while (attempt < ctx.cfg.retries) : (attempt += 1) {
-        try check(ctx.io);
-        try c.waitReady(retry_at);
-        try c.acquire();
+        try c.waitReady(retry_at, ctx.deadline);
+        try c.acquire(ctx.deadline);
         var generation: u64 = 0;
         c.mutex.lockUncancelable(ctx.io);
         const pause_epoch = c.pause_epoch;
         c.mutex.unlock(ctx.io);
-        const rate_wait = c.rateWait() catch |err| {
+        const rate_wait = c.rateWait(ctx.deadline) catch |err| {
             c.release();
             return err;
         };
         accumulated_rate +|= rate_wait;
-        check(ctx.io) catch |e| {
+        check(ctx.io, ctx.deadline) catch |e| {
             c.release();
             return e;
         };
@@ -615,6 +714,7 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
         }
         c.mutex.unlock(ctx.io);
         const result = requestTimed(ctx, url, &attempt_info);
+        defer if (result) |response| ctx.temporary.free(response.body) else |_| {};
         const ended = now(ctx.io);
         c.mutex.lockUncancelable(ctx.io);
         c.in_flight -= 1;
@@ -653,7 +753,7 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
             },
         }
         if (transport_error) c.metrics.transport_errors += 1;
-        const caller_canceled = canceled.load(.acquire) or if (result) |r| (if (r.body_error) |e| e == error.Canceled else false) else |e| e == error.Canceled;
+        const caller_canceled = isAborted(ctx.deadline) or if (result) |r| (if (r.body_error) |e| e == error.Canceled else false) else |e| e == error.Canceled;
         const body_error = if (result) |r| r.body_error != null else |_| false;
         if (ctx.cfg.concurrency_adaptive) {
             const decisions_before = c.controller.decisions_total;
@@ -666,7 +766,29 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
         c.mutex.unlock(ctx.io);
         c.release();
         accumulated_rate = 0;
-        if (ctx.cfg.http_metrics) if (ctx.trace_fn) |f| f(ctx.log_context, attempt_info.trace);
+        if (result) |_| {} else |err| {
+            if (err == error.Canceled or err == error.Timeout) {
+                // The coordinator may already be joining this future. Hand
+                // off diagnostics without waiting for any writer or file lock.
+                if (ctx.terminal_diagnostic_fn) |f| {
+                    if (attempt_info.interrupted_body_read or ctx.cfg.http_metrics)
+                        f(ctx.log_context, .{
+                            .body_error = if (attempt_info.interrupted_body_read) @errorName(err) else null,
+                            .trace = if (ctx.cfg.http_metrics) attempt_info.trace else null,
+                        });
+                }
+                return err;
+            }
+        }
+        if (ctx.cfg.http_metrics) {
+            if (isAborted(ctx.deadline)) {
+                // This attempt has an outcome, even when the worker is
+                // already canceled before it can enter the diagnostic writer.
+                if (ctx.terminal_diagnostic_fn) |f|
+                    f(ctx.log_context, .{ .body_error = null, .trace = attempt_info.trace });
+            } else if (ctx.trace_fn) |f| f(ctx.log_context, attempt_info.trace);
+        }
+        try check(ctx.io, ctx.deadline);
         retry_cause = if (transport_error) .transport else switch (status) {
             403 => .http_403,
             429 => .http_429,
@@ -675,7 +797,6 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
         };
         var retry_after: i64 = 0;
         if (result) |response| {
-            defer ctx.temporary.free(response.body);
             c.mutex.lockUncancelable(ctx.io);
             c.metrics.body_bytes += response.body.len;
             c.mutex.unlock(ctx.io);
@@ -705,17 +826,13 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
             retry_after = response.retry_after;
             last_error = error.UnexpectedStatus;
         } else |err| {
-            // The supervisor cancels and joins this page job at its deadline.
-            // It cannot safely retry in the same future: another blocked attempt
-            // would have no deadline supervisor while that join is in progress.
-            // A client timeout is a failure, never successful caller cancellation.
-            if (err == error.Canceled or err == error.Timeout or
-                err == error.AuthenticationTooLong or
+            if (err == error.AuthenticationTooLong or
                 err == error.HttpsProxyUnsupported or err == error.ProxyTunnelRefused or
                 err == error.ProxyAuthenticationRequired or err == error.ProxyTunnelUnexpectedData) return err;
             last_error = err;
             status_error = 0;
         }
+        try check(ctx.io, ctx.deadline);
         if (attempt + 1 == ctx.cfg.retries) break;
         const backoff: i64 = retryDelay(attempt);
         const delay = @max(backoff, retry_after);
@@ -734,10 +851,28 @@ pub fn errorMessage(allocator: Allocator, err: anyerror) []const u8 {
     if (std.mem.startsWith(u8, name, "Http")) return std.fmt.allocPrint(allocator, "unexpected status: {s}", .{name[4..]}) catch name;
     return name;
 }
-test "HTTP Retry-After IMF date" {
+test "HTTP Retry-After accepts decimal delays and all HTTP date formats" {
+    try std.testing.expectEqual(@as(i64, 2_000_000_000), retryAfter(std.testing.io, "\t02 "));
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sun, 06 Nov 1994 08:49:37 GMT"));
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sunday, 06-Nov-94 08:49:37 GMT"));
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sun Nov  6 08:49:37 1994"));
+}
+
+test "HTTP Retry-After rejects malformed decimals, timezones and weekdays" {
+    for ([_][]const u8{ "", "0_2", "+2", "-2" }) |value| {
+        try std.testing.expectEqual(@as(i64, 0), retryAfter(std.testing.io, value));
+    }
+    for ([_][]const u8{
+        "Sun, 06 Nov 1994 08:49:37",
+        "Sun, 06 Nov 1994 08:49:37 GMT extra",
+        "Sun, 06 Nov 1994 08:49:37 UTC",
+        "Sunday, 06-Nov-94 08:49:37 PST",
+        "Sun Nov  6 08:49:37 1994 GMT",
+        "Sun, 0_6 Nov 1994 08:49:37 GMT",
+        "Mon, 06 Nov 1994 08:49:37 GMT",
+        "Monday, 06-Nov-94 08:49:37 GMT",
+        "Mon Nov  6 08:49:37 1994",
+    }) |value| try std.testing.expectError(error.InvalidDate, parseHTTPDate(value));
 }
 
 test "rate-limit interval conversion saturates before the i64 boundary" {
@@ -765,7 +900,7 @@ test "rate-limit interval conversion saturates before the i64 boundary" {
 test "saturated rate interval also saturates the next admission timestamp" {
     const cfg: cli.Config = .{ .rate_limit = 1e-10 };
     var control = Control.init(std.testing.io, &cfg);
-    _ = try control.rateWait();
+    _ = try control.rateWait(null);
     try std.testing.expectEqual(std.math.maxInt(i64), control.rate_next);
 }
 

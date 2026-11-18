@@ -22,7 +22,9 @@ zig-nico-list --dedupe --stdin < targets.txt
 zig-nico-list --comment 10 --dateafter 20240101 --datebefore 20241231 --url https://www.nicovideo.jp/user/123
 ```
 
-Data goes to stdout. Progress, errors, logs, and the summary go to stderr, or logs to `--logfile` when requested. Dates are inclusive. IDs are numerically sorted unless `--no-sort` is set. Use `--help` for all options.
+Data goes to stdout. Progress, errors, logs, and the summary go to stderr, or logs to `--logfile` when requested. Concurrent invocations coordinate appends to the same regular file. A regular logfile needs read and write access, and a nonempty file must end with a newline. When stdout and `--logfile` share that file, each stdout batch holds the append lock through its last write. This covers hard links and descriptor paths such as `/dev/stderr`. For a piped or socket-backed stderr, `--logfile /dev/stderr` writes through the inherited descriptor. Dates are inclusive. IDs are numerically sorted unless `--no-sort` is set. Use `--help` for all options.
+
+An unterminated logfile tail stops fetching, even when stdin remains open. If logfile setup fails and stderr may share that file, the command exits with status 1 and preserves the existing data. When an access error leaves the logfile identity unknown, the diagnostic is available on stream stderr such as a pipe or terminal.
 
 Concurrency controls are independent: `-T` limits active targets, `-P` limits pages per target, and `-H` caps active HTTP requests (`0` means unlimited). `-A` enables adaptive budgets for layers you have not explicitly fixed. Retry backoff, Retry-After, request pacing, cancellation, and natural empty/404 pagination termination are retained. Please respect niconico's rate limits.
 
@@ -49,7 +51,7 @@ On Windows, use `zig-out/bin/zig-nico-list.exe` in the final command. Python 3.1
 - `--http-metrics` writes aggregate measurements and safe per-attempt JSON diagnostics. See [HTTP diagnostics](docs/HTTP_DIAGNOSTICS.md) for timing, retry, connection and adaptive-history semantics. Separate DNS/TCP/TLS/first-byte tracing and recent-window quantiles are not implemented.
 - A reused socket closed before any response can replay its GET once on a fresh connection within the original deadline, with separate transport-replay metrics.
 - HTTPS through HTTP CONNECT proxies establishes and verifies origin TLS. HTTPS-scheme proxy endpoints are explicitly unsupported; failed CONNECT never falls back to plaintext. See [HTTPS proxy security](docs/HTTPS_PROXY.md).
-- Successful HTTP response bodies are limited to 8 MiB per page. Larger bodies fail without retrying or emitting that page; previously committed pages are retained.
+- The client decodes gzip and deflate responses. The 8 MiB limit per successful page applies after decompression. Larger bodies fail without retrying or emitting that page, and previously committed pages are retained.
 - `NICO_BASE_URL` is a development/test override. The production default is `https://nvapi.nicovideo.jp/v3`.
 - Tests use deterministic localhost fixtures. CI does not make requests to the live niconico service and does not establish live-service compatibility or performance.
 - Graceful signal-driven cancellation is explicitly installed on POSIX Linux/macOS. Windows uses the platform's normal process termination behavior for console interrupts.

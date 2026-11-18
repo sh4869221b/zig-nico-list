@@ -584,20 +584,20 @@ pub const Response = struct {
                     var iter = mem.splitBackwardsScalar(u8, header_value, ',');
 
                     const first = iter.first();
-                    const trimmed_first = mem.trim(u8, first, " ");
+                    const trimmed_first = mem.trim(u8, first, " \t");
 
                     var next: ?[]const u8 = first;
-                    if (std.meta.stringToEnum(http.TransferEncoding, trimmed_first)) |transfer| {
+                    if (std.ascii.eqlIgnoreCase(trimmed_first, "chunked")) {
                         if (res.transfer_encoding != .none) return error.HttpHeadersInvalid; // we already have a transfer encoding
-                        res.transfer_encoding = transfer;
+                        res.transfer_encoding = .chunked;
 
                         next = iter.next();
                     }
 
                     if (next) |second| {
-                        const trimmed_second = mem.trim(u8, second, " ");
+                        const trimmed_second = mem.trim(u8, second, " \t");
 
-                        if (http.ContentEncoding.fromString(trimmed_second)) |transfer| {
+                        if (parseContentEncoding(trimmed_second)) |transfer| {
                             if (res.content_encoding != .identity) return error.HttpHeadersInvalid; // double compression is not supported
                             res.content_encoding = transfer;
                         } else {
@@ -615,9 +615,7 @@ pub const Response = struct {
                 } else if (std.ascii.eqlIgnoreCase(header_name, "content-encoding")) {
                     if (res.content_encoding != .identity) return error.HttpHeadersInvalid;
 
-                    const trimmed = mem.trim(u8, header_value, " ");
-
-                    if (http.ContentEncoding.fromString(trimmed)) |ce| {
+                    if (parseContentEncoding(header_value)) |ce| {
                         res.content_encoding = ce;
                     } else {
                         return error.HttpContentEncodingUnsupported;
@@ -625,6 +623,15 @@ pub const Response = struct {
                 }
             }
             return error.HttpHeadersInvalid; // missing empty line
+        }
+
+        fn parseContentEncoding(value: []const u8) ?http.ContentEncoding {
+            if (std.ascii.eqlIgnoreCase(value, "x-gzip")) return .gzip;
+            if (std.ascii.eqlIgnoreCase(value, "x-compress")) return .compress;
+            inline for (std.enums.values(http.ContentEncoding)) |encoding| {
+                if (std.ascii.eqlIgnoreCase(value, @tagName(encoding))) return encoding;
+            }
+            return null;
         }
 
         test parse {
@@ -1313,16 +1320,12 @@ pub const Request = struct {
         };
         if (r.transfer_encoding != .none and !redirect_to_get) return error.RedirectRequiresResend;
 
-        // Validate the redirect before waiting for its body. A rejected
-        // Location must preserve its own error even if the peer stalls.
-        {
-            const reader = r.reader.bodyReader(&.{}, head.transfer_encoding, head.content_length);
-            _ = reader.discardRemaining() catch |err| switch (err) {
-                error.ReadFailed => return r.reader.body_err orelse error.ReadFailed,
-            };
-            // EOF can delimit this body or arrive before Content-Length bytes.
-            // In either case the socket cannot carry the redirected request.
-            if (r.reader.state != .ready) old_connection.closing = true;
+        // Redirects need only the head. Reuse the socket only when framing
+        // proves there is no body to consume.
+        if (head.transfer_encoding == .none and head.content_length == 0) {
+            _ = r.reader.bodyReader(&.{}, .none, 0);
+        } else {
+            old_connection.closing = true;
         }
 
         r.client.connection_pool.release(old_connection, io);
@@ -2185,7 +2188,6 @@ test "rejected response heads close without draining or pooling" {
         expected: anyerror,
         redirect_behavior: Request.RedirectBehavior = .init(1),
         redirect_buffer_len: usize = 256,
-        reads: usize = 1,
     };
     for ([_]Case{
         .{ .bytes = "HTTP/1.1 1:0 OK\r\n\r\n", .expected = error.HttpHeadersInvalid },
@@ -2198,8 +2200,6 @@ test "rejected response heads close without draining or pooling" {
         .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: ftp://localhost/\r\n\r\n", .expected = error.UnsupportedUriScheme },
         .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: /next\r\n\r\n", .expected = error.TooManyHttpRedirects, .redirect_behavior = .not_allowed },
         .{ .bytes = "HTTP/1.1 101 Switching Protocols\r\n\r\n", .expected = error.HttpProtocolSwitchUnsupported },
-        .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: /next\r\n\r\n", .expected = error.ReadFailed, .reads = 2 },
-        .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 1000\r\n\r\n", .expected = error.ReadFailed, .reads = 2 },
     }) |case| {
         var backend: HeadTestIo = .{ .remaining = case.bytes };
         var vtable = Io.failing.vtable.*;
@@ -2212,9 +2212,9 @@ test "rejected response heads close without draining or pooling" {
         var redirect_buffer: [256]u8 = undefined;
         try testing.expectError(case.expected, req.receiveHead(redirect_buffer[0..case.redirect_buffer_len]));
         try testing.expect(req.connection.?.closing);
-        try testing.expectEqual(case.reads, backend.reads);
+        try testing.expectEqual(@as(usize, 1), backend.reads);
         req.deinit();
-        try testing.expectEqual(case.reads, backend.reads);
+        try testing.expectEqual(@as(usize, 1), backend.reads);
         try testing.expectEqual(@as(usize, 1), backend.closes);
         try testing.expectEqual(@as(usize, 0), client.connection_pool.free_len);
     }

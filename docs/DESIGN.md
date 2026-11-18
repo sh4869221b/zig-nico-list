@@ -51,8 +51,10 @@ Retry/cooldown readiness is checked before HTTP admission; the rate wait after
 admission only reserves the next pacing slot and checks cancellation.
 
 The scheduler assembles page results in page-number order even when they finish
-out of order. The earliest terminal page determines the valid prefix. A later
-page failure or timeout cannot erase an earlier valid terminal result.
+out of order. The earliest terminal page determines the valid prefix. Observing
+a terminal page cancels jobs with higher page numbers, including retries that
+are still waiting on Retry-After. Lower page numbers can still contribute
+results or establish an earlier end to the prefix.
 
 ## Deadlines and cancellation
 
@@ -64,24 +66,66 @@ active deadline, with a 20 ms maximum signal-poll interval. Completion checks
 its own timestamp as well, so a short timeout cannot be missed between polls.
 
 The coordinator continues deadline and cancellation supervision while its one
-sink task emits an event, including when stdout is blocked. It does not admit
-more input or launch more page work during emission. There is no output queue,
-and it joins the sink before releasing borrowed page memory or emitting another
-event. The sink releases the diagnostic mutex before writing stdout, so canceled
-HTTP jobs can log and finish independently. Caller cancellation also cancels a
-blocked sink; failed writes are not flushed again from a later cleanup path.
+sink task emits an event, including when stdout or stderr is blocked. It does
+not admit more input or launch more page work during emission. It joins the
+sink before releasing borrowed page memory or emitting another event. With
+`--no-sort`, the sink flushes a completed target's stdout before delivering
+its diagnostics. Diagnostic mutex acquisition and writes can be canceled.
+Caller cancellation releases a blocked sink before the coordinator joins
+other pages. Failed stdout writes are not retried during cleanup.
+For streaming output, the summary counts IDs whose terminating delimiter the
+OS accepted before interruption. Embedded newlines in an ID do not add to the count.
+If the logfile and a standard stream share a regular file, the sink uses
+locked appends for both. It holds the lock from the first write through the
+flush of each stdout batch, preventing another cooperating writer from
+inserting data between an ID and its delimiter. It advances matching
+inherited offsets to EOF under the lock at exit. If lock acquisition is
+interrupted, the child attempts a best-effort seek to the observed EOF
+without waiting for the lock again. The inherited append flags are preserved.
+A parent appending during the run, after an abnormal exit, or while another
+writer may have changed EOF must acquire the same file lock, check that the
+file is empty or ends with a newline, and seek to EOF within that lock
+before writing, even after waiting for the child.
 After fetching finishes, sorted line output and JSON serialization plus their
-final flush run in one awaited output task with the same signal polling. A full
-stdout pipe therefore remains interruptible through the end of the command;
-failed final writes also discard retained writer bytes before cleanup.
+final flush run in an awaited output task. The final diagnostics and stream
+flushes use the same signal polling, so full stdout and stderr pipes remain
+interruptible at shutdown. Failed final writes discard retained writer bytes
+before cleanup.
 Final-output interruption watches a separate signal flag. Input-read errors stop
 fetching through the shared shutdown flag, but completed results are fully
 written before reporting that input error. SIGINT/SIGTERM can still interrupt
 the final write even after an input error has stopped fetching.
 
 Io.Future.cancel cancellation is consumed at the next cancellation point, and
-std.http may wrap it in ReadFailed. The owning Deadline therefore preserves the
-reason independently of the transport error. Client timeout stays Timeout for
+std.http or a diagnostic write may wrap the error. The owning Deadline
+preserves the reason independently of the returned error. Page jobs check
+the abort flag after diagnostics, during backoff and admission, and before
+starting and sending another request. Workers hand off timeout and
+cancellation diagnostics in memory and wake the coordinator as they finish.
+The sink can emit these diagnostics before the target completes. When the
+sink is interrupted, it leaves pending records for the final report and
+keeps track of which records have already been delivered. A normal attempt
+whose diagnostic write is interrupted also hands its trace to the final
+report. Streams retain unwritten bytes and resume at the first unsent byte.
+On a regular logfile the writer verifies that its own partial append still
+matches the tail and rolls back those bytes before unlocking. A later retry
+can then emit the complete record. Every cooperating append checks the file
+tail while holding the lock. If a failed rollback or interrupted writer leaves
+an unterminated tail, the next append fails and preserves the bytes. Shared
+file progress updates end with a newline so they are complete records too.
+Logfile setup compares both the write-only handle and the read/write handle
+with inherited stderr. After a failed open, the path can already point to a
+replacement file. Diagnostics to regular stderr rely on the opened handles
+and path errors that rule out a regular target, such as `NameTooLong` and
+`SymLinkLoop`. An ambiguous access failure exits with status 1 and leaves
+regular stderr untouched. Stream stderr still receives the diagnostic.
+Startup checks the tail before reading inputs when the lock is available.
+When another writer holds the lock, a cancellable task checks the tail once
+it acquires the lock, independently of HTTP metrics and writes. The
+coordinator joins that task before final output. An incomplete tail or
+failed rollback during an append also stops fetching and cancels the input
+reader. The final report retains the original failure.
+Client timeout stays Timeout for
 adaptive overload feedback and is propagated as a terminal page failure. It is
 not retried inside the canceled page future: the supervisor is joining that
 future and cannot supervise a new attempt there. A zero-byte response-head EOF on a reused socket can replay the GET once on a
@@ -147,9 +191,12 @@ The previous port differed on two documented cases. These are fixes toward the
 original contract, not deleted features.
 
 Successful HTTP response bodies are buffered up to 8 MiB, inclusive, independent
-of Content-Length or framing. Larger bodies fail with ResponseBodyTooLarge
-without decoding, retrying, or draining the remaining body; earlier committed
-pages remain available through the existing partial-result contract.
+of Content-Length or framing. For gzip and deflate this limit applies to the
+decompressed body. The client verifies mandatory compression header fields
+and the footer and completes
+HTTP framing before parsing JSON. Larger bodies fail with ResponseBodyTooLarge
+and earlier committed pages remain available through the partial-result contract.
+The client closes the rejected response immediately.
 The HTTP response itself is still fully buffered within that limit. "Token projection" refers to
 parsing that buffer without full schema/DOM materialization; it is not claimed
 to stream raw network bytes directly into the final output.
