@@ -855,6 +855,42 @@ class CliIntegration(unittest.TestCase):
                 self.assertEqual(server.requests, [])
                 self.assertEqual(log.read_bytes(), original)
 
+    def test_logfile_directory_error_reaches_separate_regular_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            log = Path(tmp) / 'log-directory'
+            log.mkdir()
+            stderr_path = Path(tmp) / 'stderr.txt'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with stderr_path.open('wb') as stderr:
+                result = subprocess.run([BINARY, '--no-progress', '--logfile', str(log), USER],
+                                        env=env, stdout=subprocess.PIPE, stderr=stderr, timeout=3)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, b'')
+            self.assertIn(b'IsDir', stderr_path.read_bytes())
+            self.assertEqual(server.requests, [])
+
+    @unittest.skipUnless(os.name == 'posix' and os.geteuid() != 0, 'requires non-root POSIX permissions')
+    def test_logfile_access_denied_reports_only_to_separate_regular_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            log = Path(tmp) / 'read-only.jsonl'
+            stderr_path = Path(tmp) / 'stderr.txt'
+            original = b'{"msg":"existing record"}\n'
+            log.write_bytes(original)
+            args = [BINARY, '--no-progress', '--logfile', str(log), USER]
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with log.open('r+b') as shared_stderr:
+                log.chmod(0o400)
+                with stderr_path.open('wb') as separate_stderr:
+                    separate = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=separate_stderr, timeout=3)
+                shared = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=shared_stderr, timeout=3)
+            self.assertEqual(separate.returncode, 1)
+            self.assertEqual(shared.returncode, 1)
+            self.assertEqual(separate.stdout, b'')
+            self.assertEqual(shared.stdout, b'')
+            self.assertIn(b'AccessDenied', stderr_path.read_bytes())
+            self.assertEqual(log.read_bytes(), original)
+            self.assertEqual(server.requests, [])
+
     def test_incomplete_logfile_fails_before_fetch_even_with_open_stdin(self):
         with tempfile.TemporaryDirectory() as tmp, fixture() as server:
             path = Path(tmp) / 'partial.jsonl'
@@ -907,6 +943,32 @@ class CliIntegration(unittest.TestCase):
                         fcntl.flock(lock_file, fcntl.LOCK_UN)
                         self.assertEqual(proc.wait(timeout=3), 1)
                         _, stderr = proc.communicate(timeout=3)
+                        self.assertIn(b'IncompleteLogRecord', stderr)
+                        self.assertEqual(server.requests, [1])
+                        self.assertEqual(path.read_bytes(), original)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock')
+    def test_deferred_log_tail_check_stops_open_stdin_without_metrics(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            path = Path(tmp) / 'partial.jsonl'
+            original = b'{"msg":"partial'
+            path.write_bytes(original)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('r+b') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                with subprocess.Popen(
+                        [BINARY, '--no-progress', '--no-sort', '--stdin', '-P2', '--logfile', str(path), USER],
+                        env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                    try:
+                        self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        self.assertEqual(proc.wait(timeout=3), 1)
+                        stdout, stderr = proc.communicate(timeout=3)
+                        self.assertEqual(stdout, b'sm10\nsm2\n')
                         self.assertIn(b'IncompleteLogRecord', stderr)
                         self.assertEqual(server.requests, [1])
                         self.assertEqual(path.read_bytes(), original)

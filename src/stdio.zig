@@ -83,13 +83,36 @@ const Identity = struct {
     fn matches(self: Identity, file: Io.File) bool {
         return if (get(file)) |other| std.meta.eql(self, other) else false;
     }
+
+    fn distinct(first: ?Identity, second: ?Identity) bool {
+        const a = first orelse return false;
+        const b = second orelse return false;
+        return a.extended == b.extended and !std.meta.eql(a, b);
+    }
 };
+
+fn failedTargetIsDistinct(io: Io, dir: Io.Dir, path: []const u8, stderr: Io.File, err: Io.File.OpenError) bool {
+    return switch (err) {
+        error.IsDir => true,
+        error.FileNotFound, error.NotDir => descriptorPath(path) == null,
+        error.AccessDenied => blk: {
+            // A failed open supplies no handle. Metadata may still identify
+            // the path without requiring permission to read or write it.
+            const target = dir.statFile(io, path, .{}) catch break :blk false;
+            const inherited = stderr.stat(io) catch break :blk false;
+            // Different inode numbers prove a difference without the volume.
+            break :blk target.kind != inherited.kind or
+                (target.inode != 0 and inherited.inode != 0 and target.inode != inherited.inode);
+        },
+        else => false,
+    };
+}
 
 pub fn openLog(io: Io, path: []const u8, stderr: Io.File, can_report_on_stderr: *bool) !struct { file: Io.File, regular: bool } {
     const dir = Io.Dir.cwd();
+    const stderr_is_stream = can_report_on_stderr.*;
     const opened = dir.createFile(io, path, .{ .truncate = false }) catch |err| {
-        if (descriptorPath(path) == null and (err == error.FileNotFound or err == error.NotDir))
-            can_report_on_stderr.* = true;
+        can_report_on_stderr.* = stderr_is_stream or failedTargetIsDistinct(io, dir, path, stderr, err);
         return err;
     };
     errdefer opened.close(io);
@@ -100,16 +123,25 @@ pub fn openLog(io: Io, path: []const u8, stderr: Io.File, can_report_on_stderr: 
     const identity = Identity.get(opened) orelse return error.LogFileIdentityUnavailable;
     // Even a write-only handle identifies an alias. Resolve it before reopening
     // so a failure cannot send a diagnostic through the inherited file offset.
-    if (Identity.get(stderr)) |other| can_report_on_stderr.* = !std.meta.eql(identity, other);
+    const stderr_identity = if (stderr_is_stream) null else Identity.get(stderr);
+    const first_is_distinct = Identity.distinct(identity, stderr_identity);
+    can_report_on_stderr.* = stderr_is_stream or first_is_distinct;
     var path_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
     // Darwin descriptor paths can duplicate the original write-only handle.
     const reopen_path = if (builtin.os.tag == .macos and descriptorPath(path) != null)
         path_buffer[0..try opened.realPath(io, &path_buffer)]
     else
         path;
-    const file = try dir.openFile(io, reopen_path, .{ .mode = .read_write });
+    const file = dir.openFile(io, reopen_path, .{ .mode = .read_write }) catch |err| {
+        can_report_on_stderr.* = stderr_is_stream or
+            (first_is_distinct and failedTargetIsDistinct(io, dir, reopen_path, stderr, err));
+        return err;
+    };
     errdefer file.close(io);
-    if (!identity.matches(file)) return error.LogFileChanged;
+    const reopened_identity = Identity.get(file);
+    can_report_on_stderr.* = stderr_is_stream or
+        (first_is_distinct and Identity.distinct(reopened_identity, stderr_identity));
+    if (!std.meta.eql(identity, reopened_identity orelse return error.LogFileChanged)) return error.LogFileChanged;
     opened.close(io);
     return .{ .file = file, .regular = true };
 }
@@ -142,10 +174,16 @@ pub const AppendFile = struct {
         return end;
     }
 
-    pub fn checkInitialTail(self: *AppendFile) !void {
-        // Let an active writer finish, leaving validation to the first append.
-        if (!try self.file.tryLock(self.io, .exclusive)) return;
+    pub fn tryCheckInitialTail(self: *AppendFile) !bool {
+        if (!try self.file.tryLock(self.io, .exclusive)) return false;
         defer self.file.unlock(self.io);
+        _ = try self.checkedEnd();
+        return true;
+    }
+
+    pub fn checkTailWhenAvailable(self: *AppendFile) !void {
+        try self.lock();
+        defer self.unlock();
         _ = try self.checkedEnd();
     }
 
@@ -275,6 +313,62 @@ pub const Writer = struct {
         try stdout_sync;
     }
 };
+
+test "logfile replacement is compared with inherited stderr before reporting" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
+    const Backend = struct {
+        io: Io,
+        dir: Io.Dir,
+        replacement: []const u8,
+
+        fn create(context: ?*anyopaque, _: Io.Dir, path: []const u8, options: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.dir.createFile(self.io, path, options);
+        }
+
+        fn open(context: ?*anyopaque, _: Io.Dir, _: []const u8, options: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.dir.openFile(self.io, self.replacement, options);
+        }
+
+        fn stat(context: ?*anyopaque, file: Io.File) Io.File.StatError!Io.File.Stat {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return file.stat(self.io);
+        }
+
+        fn close(context: ?*anyopaque, files: []const Io.File) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            for (files) |file| file.close(self.io);
+        }
+    };
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const stderr_file = try tmp.dir.createFile(io, "stderr.log", .{});
+    defer stderr_file.close(io);
+    (try tmp.dir.createFile(io, "other.log", .{})).close(io);
+    var backend: Backend = .{ .io = io, .dir = tmp.dir, .replacement = "stderr.log" };
+    var vtable = Io.failing.vtable.*;
+    vtable.dirCreateFile = Backend.create;
+    vtable.dirOpenFile = Backend.open;
+    vtable.fileStat = Backend.stat;
+    vtable.fileClose = Backend.close;
+    const replaced_io: Io = .{ .userdata = &backend, .vtable = &vtable };
+    var can_report = false;
+    try std.testing.expectError(error.LogFileChanged, openLog(replaced_io, "original.log", stderr_file, &can_report));
+    try std.testing.expect(!can_report);
+
+    backend.replacement = "other.log";
+    try std.testing.expectError(error.LogFileChanged, openLog(replaced_io, "original.log", stderr_file, &can_report));
+    try std.testing.expect(can_report);
+
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        backend.replacement = "/dev/null";
+        can_report = false;
+        try std.testing.expectError(error.LogFileChanged, openLog(replaced_io, "original.log", stderr_file, &can_report));
+        try std.testing.expect(!can_report);
+    }
+}
 
 test "one shared output batch keeps its lock across short writes and ID terminators" {
     const Backend = struct {

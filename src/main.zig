@@ -388,6 +388,14 @@ fn fail(err: *Io.Writer, text: []const u8) !u8 {
     try err.print("Error: {s}\n", .{text});
     return 1;
 }
+
+fn checkDeferredLogTail(append: *stdio.AppendFile) !void {
+    append.checkTailWhenAvailable() catch |err| {
+        if (err != error.Canceled) domain.canceled.store(true, .release);
+        return err;
+    };
+}
+
 fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, logfile: *?stdio.AppendFile) !u8 {
     const a = init.arena.allocator();
     const out = &stdout.interface;
@@ -411,11 +419,13 @@ fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, log
     if (try cli.validate(a, cfg)) |message| return superviseIo(init.io, fail, .{ err, message });
     var append: ?*stdio.AppendFile = null;
     var log_destination = stderr.file;
+    var can_report_on_stderr = true;
+    var log_tail_checked = true;
     if (cfg.logfile.len > 0) {
         const stderr_regular = stdio.isRegular(init.io, stderr.file);
         const inherited = stdio.descriptorPath(cfg.logfile);
         if (inherited == null or (stderr_regular catch return 1)) {
-            var can_report_on_stderr = !(stderr_regular catch true);
+            can_report_on_stderr = !(stderr_regular catch true);
             const opened = stdio.openLog(init.io, cfg.logfile, stderr.file, &can_report_on_stderr) catch |e| {
                 if (!can_report_on_stderr) return 1;
                 return superviseIo(init.io, fail, .{ err, try std.fmt.allocPrint(a, "open {s}: {s}", .{ cfg.logfile, @errorName(e) }) });
@@ -425,7 +435,7 @@ fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, log
             if (opened.regular) {
                 append = &logfile.*.?;
                 append.?.bind(stdout, stderr);
-                superviseIo(init.io, stdio.AppendFile.checkInitialTail, .{append.?}) catch |e| {
+                log_tail_checked = superviseIo(init.io, stdio.AppendFile.tryCheckInitialTail, .{append.?}) catch |e| {
                     if (!can_report_on_stderr) return 1;
                     return e;
                 };
@@ -470,7 +480,15 @@ fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, log
         .has_diagnostics = Runner.hasTerminalDiagnostics,
     });
     defer engine.deinit();
-    const input_error = try engine.run(parsed.inputs);
+    // A contended lock must not hold up HTTP supervision. Join the check
+    // before final output, which validates the tail again on every append.
+    var tail_check = if (log_tail_checked) null else try Io.concurrent(init.io, checkDeferredLogTail, .{append.?});
+    const input_result = engine.run(parsed.inputs);
+    const log_error: ?anyerror = if (tail_check) |*task| blk: {
+        task.cancel(init.io) catch |err_code| if (err_code != error.Canceled) break :blk err_code;
+        break :blk null;
+    } else null;
+    const input_error = try input_result;
     const results = try a.alloc(cli.TargetResult, runner.results.items.len);
     for (runner.results.items, results) |r, *dest| dest.* = r.*;
     const counts = runner.counts;
@@ -490,6 +508,10 @@ fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, log
             output_error = e;
             break :blk 0;
         };
+    }
+    if (log_error) |e| {
+        if (!can_report_on_stderr) return 1;
+        return e;
     }
     return superviseIo(init.io, Runner.report, .{ &runner, input_error, output_error }) catch |e| {
         // Keep an incomplete JSON prefix on stderr free of plain error text.
