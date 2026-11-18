@@ -79,12 +79,13 @@ If the logfile and a standard stream share a regular file, the sink uses
 locked appends for both. It holds the lock from the first write through the
 flush of each stdout batch, preventing another cooperating writer from
 inserting data between an ID and its delimiter. It advances matching
-inherited offsets to EOF under the lock at exit. The inherited append flags
-are preserved. An unsynchronized parent writing to the inherited descriptor
-while the child is still running can overwrite existing data at its stale
-offset. A cooperating concurrent writer takes the same lock and finds EOF
-for each append. A parent that waits for the child can use the synchronized
-offset.
+inherited offsets to EOF under the lock at exit. If lock acquisition is
+interrupted, the child attempts a best-effort seek to the observed EOF
+without waiting for the lock again. The inherited append flags are preserved.
+A parent appending during the run, after an abnormal exit, or while another
+writer may have changed EOF must acquire the same file lock, check that the
+file is empty or ends with a newline, and seek to EOF within that lock
+before writing, even after waiting for the child.
 After fetching finishes, sorted line output and JSON serialization plus their
 final flush run in an awaited output task. The final diagnostics and stream
 flushes use the same signal polling, so full stdout and stderr pipes remain
@@ -105,10 +106,13 @@ The sink can emit these diagnostics before the target completes. When the
 sink is interrupted, it leaves pending records for the final report and
 keeps track of which records have already been delivered. A normal attempt
 whose diagnostic write is interrupted also hands its trace to the final
-report. If a record prefix was accepted, the diagnostic writer retains its
-unsent bytes. It resumes those bytes before emitting another record. For a
-regular file, resumption requires the same EOF where the prefix ended. A
-changed EOF reports an error and leaves the file intact.
+report. Streams retain unwritten bytes and resume at the first unsent byte.
+On a regular logfile the writer verifies that its own partial append still
+matches the tail and rolls back those bytes before unlocking. A later retry
+can then emit the complete record. Every cooperating append checks the file
+tail while holding the lock. If a failed rollback or interrupted writer leaves
+an unterminated tail, the next append fails and preserves the bytes. Shared
+file progress updates end with a newline so they are complete records too.
 Client timeout stays Timeout for
 adaptive overload feedback and is propagated as a terminal page failure. It is
 not retried inside the canceled page future: the supervisor is joining that

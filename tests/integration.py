@@ -766,7 +766,7 @@ class CliIntegration(unittest.TestCase):
                                   ['http_attempt', 'video list', 'http_metrics'] * len(children))
 
     @unittest.skipUnless(sys.platform == 'linux', 'requires Linux prlimit')
-    def test_partial_trace_resumes_without_replaying_its_prefix(self):
+    def test_partial_trace_is_rolled_back_before_another_process_appends(self):
         import resource
         let_request_finish = threading.Event()
         request_started = threading.Event()
@@ -792,12 +792,13 @@ class CliIntegration(unittest.TestCase):
                     old_limit = resource.prlimit(proc.pid, resource.RLIMIT_FSIZE)
                     resource.prlimit(proc.pid, resource.RLIMIT_FSIZE, (150, old_limit[1]))
                     let_request_finish.set()
-                    until = time.monotonic() + 2
-                    while log.stat().st_size < 150 and time.monotonic() < until:
-                        time.sleep(.01)
-                    self.assertEqual(log.stat().st_size, 150)
-                    self.assertFalse(log.read_bytes().endswith(b'\n'))
-                    time.sleep(.15)
+                    # Give the first writer time to hit the limit and enter
+                    # Retry-After. The other process has its normal file limit.
+                    time.sleep(.25)
+                    competing = command(server, '-P2', '--http-metrics', '--logfile', str(log), USER)
+                    self.check_ok(competing, 'sm1\n')
+                    self.assertIsNone(proc.poll())
+                    competing_records = log.read_text()
                     resource.prlimit(proc.pid, resource.RLIMIT_FSIZE, old_limit)
                     stdout, stderr = proc.communicate(timeout=5)
                     self.assertEqual(proc.returncode, 0, stderr)
@@ -806,9 +807,22 @@ class CliIntegration(unittest.TestCase):
                     let_request_finish.set()
                     if proc.poll() is None:
                         proc.kill()
+            early_rows = [json.loads(line) for line in competing_records.splitlines()]
+            self.assertEqual([row['attempt']['status'] for row in early_rows if row['msg'] == 'http_attempt'], [200])
             records = [json.loads(line) for line in log.read_text().splitlines()]
-            self.assertEqual([(row['attempt']['request_id'], row['attempt']['status'])
-                              for row in records if row['msg'] == 'http_attempt'], [(1, 429), (2, 200)])
+            self.assertCountEqual([(row['attempt']['request_id'], row['attempt']['status'])
+                                   for row in records if row['msg'] == 'http_attempt'],
+                                  [(1, 200), (1, 429), (2, 200)])
+
+    def test_regular_logfile_refuses_an_incomplete_tail_from_another_writer(self):
+        with tempfile.TemporaryDirectory() as tmp, fixture() as server:
+            path = Path(tmp) / 'partial.jsonl'
+            original = b'{"msg":"previous"}\n{"msg":"partial'
+            path.write_bytes(original)
+            result = command(server, '-P2', '--http-metrics', '--logfile', str(path), USER)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('IncompleteLogRecord', result.stderr)
+            self.assertEqual(path.read_bytes(), original)
 
     @unittest.skipUnless(Path('/dev/stderr').exists(), 'requires /dev/stderr')
     def test_logfile_and_summary_append_to_the_same_regular_stderr(self):
@@ -818,7 +832,7 @@ class CliIntegration(unittest.TestCase):
             path.write_bytes(prefix)
             env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
             with path.open('r+b') as stderr:
-                result = subprocess.run([BINARY, '--no-progress', '-P2', '--http-metrics',
+                result = subprocess.run([BINARY, '--progress', '-P2', '--http-metrics',
                                          '--logfile', '/dev/stderr', USER],
                                         env=env, stdout=subprocess.PIPE, stderr=stderr, timeout=5)
             self.assertEqual(result.returncode, 0)
@@ -827,7 +841,8 @@ class CliIntegration(unittest.TestCase):
             lines = path.read_text().splitlines()
             self.assertEqual([json.loads(line)['msg'] for line in lines if line.startswith('{')],
                              ['existing', 'http_attempt', 'video list', 'http_metrics'])
-            self.assertEqual(len(lines), 5)
+            self.assertEqual(len([line for line in lines if line]), 6)
+            self.assertIn('1/1', lines)
             self.assertTrue(any(line.startswith('summary ') for line in lines))
 
     def test_logfile_identity_preserves_merged_output_and_inherited_offsets(self):
@@ -863,6 +878,36 @@ class CliIntegration(unittest.TestCase):
                     self.assertLess(summary, metrics)
                     self.assertEqual([line for line in lines if line in (b'sm2', b'sm10')],
                                      [b'sm2', b'sm10'] if merged else [])
+
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate file lock and SIGTERM')
+    def test_sigterm_offset_sync_falls_back_without_waiting_for_the_logfile_lock(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp, fixture(
+                lambda *_: (429, b'', {'Retry-After': '15'}, False)) as server:
+            path = Path(tmp) / 'run.log'
+            prefix = b'{"msg":"previous"}\n'
+            path.write_bytes(prefix)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('r+b', buffering=0) as stderr, path.open('r+b') as lock_file:
+                stderr.seek(0, os.SEEK_END)
+                with subprocess.Popen(
+                        [BINARY, '--no-progress', '--http-metrics', '--logfile', str(path), USER],
+                        stdout=subprocess.PIPE, stderr=stderr, env=env) as proc:
+                    try:
+                        until = time.monotonic() + 3
+                        while b'HTTP attempt returned error status' not in path.read_bytes() and time.monotonic() < until:
+                            time.sleep(.01)
+                        self.assertIn(b'HTTP attempt returned error status', path.read_bytes())
+                        fcntl.flock(lock_file, fcntl.LOCK_EX)
+                        before = path.read_bytes()
+                        proc.send_signal(signal.SIGTERM)
+                        self.assertEqual(proc.wait(timeout=3), 1)
+                        self.assertEqual(stderr.tell(), len(before))
+                        stderr.write(b'parent after wait\n')
+                        self.assertEqual(path.read_bytes(), before + b'parent after wait\n')
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
 
     @unittest.skipUnless(os.name == 'posix', 'requires a full pipe and SIGTERM')
     def test_summary_flush_precedes_metrics_in_a_separate_logfile(self):

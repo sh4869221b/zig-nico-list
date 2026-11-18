@@ -84,9 +84,10 @@ attempt numbers, and an invocation-local unique `request_id` (dispatch order).
   decompression when applicable.
   The output task can emit timeout diagnostics while an earlier page is
   still retrying. The final report resumes pending records, including
-  ordinary attempt traces whose write was interrupted. A partially accepted
-  record resumes at its first unsent byte. On a regular file the writer
-  checks that EOF still follows its recorded prefix before resuming. It flushes the
+  ordinary attempt traces whose write was interrupted. Streams resume at the
+  first unsent byte. Regular logfiles roll back a verified partial append
+  before releasing the lock and reject an unterminated tail before appending.
+  The final report flushes the
   summary before sending aggregate HTTP metrics, including when the two
   use different streams. Use `request_id` to correlate attempt records.
 - `service_ns` and all phase timings sum concurrent attempt durations, so they

@@ -29,8 +29,12 @@ pub fn main(init: std.process.Init) void {
     const flush: FinalFlush = .{ .out = &stdout.interface, .err = &stderr.interface, .result = result };
     var status = superviseFinalWrite(init.io, FinalFlush.run, .{flush}) catch 1;
     if (stdout.append != null or stderr.append != null)
-        superviseFinalWrite(init.io, stdio.Writer.syncInheritedOffsets, .{ &stdout, &stderr }) catch {
+        superviseFinalWrite(init.io, stdio.Writer.syncInheritedOffsets, .{ &stdout, &stderr, true }) catch {
             status = 1;
+            // A canceled lock wait must not prevent an EOF seek when the
+            // inherited handles remain usable. Re-sample EOF without waiting
+            // for the lock, in its own bounded shutdown task.
+            superviseFinalWrite(init.io, stdio.Writer.syncInheritedOffsets, .{ &stdout, &stderr, false }) catch {};
         };
     if (logfile) |file| file.file.close(init.io);
     stdout.id_ends.deinit(init.gpa);
@@ -57,6 +61,7 @@ const Log = struct {
     append: ?*stdio.AppendFile,
     buffer: Io.Writer.Allocating,
     sent: usize = 0,
+    shared_stderr: bool = false,
     mutex: Io.Mutex = .init,
 
     fn writeRecord(self: *Log, comptime encode: anytype, args: anytype) !void {
@@ -106,6 +111,7 @@ const Log = struct {
         try self.flushRecord();
         errdefer self.err.end = 0;
         try self.err.print("\r{d}/{d}", .{ completed, total });
+        if (self.shared_stderr) try self.err.writeByte('\n');
         try self.err.flush();
     }
 
@@ -301,7 +307,7 @@ const Runner = struct {
         try self.writeTerminalDiagnostics();
         try self.diagnostics.writeRecord(Log.videoList, .{self.output_count});
         try self.diagnostics.flushPending();
-        if (self.show_progress) try self.err.writeByte('\n');
+        if (self.show_progress and !self.diagnostics.shared_stderr) try self.err.writeByte('\n');
         try self.err.print("summary inputs={d} valid={d} invalid={d} fetch_ok={d} fetch_err={d} output_count={d}\n", .{ counts.total, counts.valid, counts.invalid, self.fetch_ok, self.fetch_err, self.output_count });
         try self.err.flush();
         if (self.cfg.http_metrics) try self.diagnostics.writeRecord(Log.metrics, .{self.ctx.control});
@@ -397,11 +403,11 @@ fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, log
     if (cfg.logfile.len > 0) {
         const inherited = stdio.descriptorPath(cfg.logfile);
         if (inherited == null or try stdio.isRegular(init.io, inherited.?)) {
-            const file = Io.Dir.cwd().createFile(init.io, cfg.logfile, .{ .truncate = false }) catch |e|
+            const opened = stdio.openLog(init.io, cfg.logfile) catch |e|
                 return superviseFinalWrite(init.io, fail, .{ err, try std.fmt.allocPrint(a, "open {s}: {s}", .{ cfg.logfile, @errorName(e) }) });
-            logfile.* = .{ .io = init.io, .file = file };
-            log_destination = file;
-            if (try stdio.isRegular(init.io, file)) {
+            logfile.* = .{ .io = init.io, .file = opened.file };
+            log_destination = opened.file;
+            if (opened.regular) {
                 append = &logfile.*.?;
                 append.?.bind(stdout, stderr);
             }
@@ -427,6 +433,7 @@ fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, log
             .file = log_destination,
             .append = append,
             .buffer = .init(init.gpa),
+            .shared_stderr = stderr.append != null,
         },
         .ctx = .{ .result_allocator = a, .temporary = init.gpa, .io = init.io, .cfg = cfg, .control = &control, .client = &client },
 

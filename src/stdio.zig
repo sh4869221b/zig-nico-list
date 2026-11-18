@@ -85,13 +85,34 @@ const Identity = struct {
     }
 };
 
+pub fn openLog(io: Io, path: []const u8) !struct { file: Io.File, regular: bool } {
+    const dir = Io.Dir.cwd();
+    const opened = try dir.createFile(io, path, .{ .truncate = false });
+    errdefer opened.close(io);
+    if (!try isRegular(io, opened)) return .{ .file = opened, .regular = false };
+
+    // Stream destinations retain write-only open semantics. Use one read/write
+    // handle for a regular file so tail validation and writes share its lock.
+    const identity = Identity.get(opened) orelse return error.LogFileIdentityUnavailable;
+    var path_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+    // Darwin descriptor paths can duplicate the original write-only handle.
+    const reopen_path = if (builtin.os.tag == .macos and descriptorPath(path) != null)
+        path_buffer[0..try opened.realPath(io, &path_buffer)]
+    else
+        path;
+    const file = try dir.openFile(io, reopen_path, .{ .mode = .read_write });
+    errdefer file.close(io);
+    if (!identity.matches(file)) return error.LogFileChanged;
+    opened.close(io);
+    return .{ .file = file, .regular = true };
+}
+
 /// All writers using this regular file share the process-local mutex and use
 /// a file lock to coordinate the EOF lookup and write with other invocations.
 pub const AppendFile = struct {
     io: Io,
     file: Io.File,
     mutex: Io.Mutex = .init,
-    incomplete_end: ?u64 = null,
 
     fn lock(self: *AppendFile) !void {
         try self.mutex.lock(self.io);
@@ -104,29 +125,60 @@ pub const AppendFile = struct {
         self.mutex.unlock(self.io);
     }
 
+    fn checkedEnd(self: *AppendFile) !u64 {
+        const end = try self.file.length(self.io);
+        if (end != 0) {
+            var last: [1]u8 = undefined;
+            const n = try self.file.readPositional(self.io, &.{&last}, end - 1);
+            if (n != 1 or last[0] != '\n') return error.IncompleteLogRecord;
+        }
+        return end;
+    }
+
+    fn rollback(self: *AppendFile, start: u64, prefix: []const u8) !void {
+        // Never truncate bytes that do not match this append. The file lock
+        // excludes cooperating writers throughout validation and cleanup.
+        const expected_end = start + prefix.len;
+        if (try self.file.length(self.io) != expected_end) return error.LogRecordRollbackFailed;
+        var buffer: [4096]u8 = undefined;
+        var checked: usize = 0;
+        while (checked < prefix.len) {
+            const chunk = buffer[0..@min(buffer.len, prefix.len - checked)];
+            const n = try self.file.readPositionalAll(self.io, chunk, start + checked);
+            if (n != chunk.len or !std.mem.eql(u8, chunk, prefix[checked..][0..n])) return error.LogRecordRollbackFailed;
+            checked += n;
+        }
+        if (try self.file.length(self.io) != expected_end) return error.LogRecordRollbackFailed;
+        try self.file.setLength(self.io, start);
+    }
+
+    fn writeAllAt(self: *AppendFile, start: u64, bytes: []const u8, sent: *usize) !void {
+        while (sent.* < bytes.len) {
+            const n = try self.file.writePositional(self.io, &.{bytes[sent.*..]}, start + sent.*);
+            if (n == 0) return error.WriteZero;
+            sent.* += n;
+        }
+    }
+
     pub fn writeRecord(self: *AppendFile, bytes: []const u8, sent: *usize) !void {
         try self.lock();
         defer self.unlock();
-        var offset = try self.file.length(self.io);
-        if (self.incomplete_end) |expected| {
-            // Never replay a prefix or rewrite a later writer's bytes.
-            if (offset != expected) return error.InterleavedLogRecord;
-        }
-        while (sent.* < bytes.len) {
-            const n = try self.file.writePositional(self.io, &.{bytes[sent.*..]}, offset);
-            if (n == 0) return error.WriteZero;
-            sent.* += n;
-            offset += n;
-            self.incomplete_end = offset;
-        }
-        self.incomplete_end = null;
+        const start = try self.checkedEnd();
+        // A prefix left by a failed recovery cannot be resumed after unlock.
+        if (sent.* != 0) return error.LogRecordRollbackFailed;
+        self.writeAllAt(start, bytes, sent) catch |err| {
+            if (sent.* != 0) {
+                self.rollback(start, bytes[0..sent.*]) catch return error.LogRecordRollbackFailed;
+                sent.* = 0;
+            }
+            return err;
+        };
     }
 
     fn beginOutput(self: *AppendFile) !u64 {
         try self.lock();
         errdefer self.unlock();
-        if (self.incomplete_end != null) return error.IncompleteLogRecord;
-        return self.file.length(self.io);
+        return self.checkedEnd();
     }
 
     fn write(self: *AppendFile, header: []const u8, data: []const []const u8, splat: usize) !usize {
@@ -199,13 +251,14 @@ pub const Writer = struct {
 
     /// Parent processes may continue writing through the inherited handles.
     /// Positional appends leave those handles' offsets alone during the run.
-    pub fn syncInheritedOffsets(stdout: *Writer, stderr: *Writer) !void {
+    pub fn syncInheritedOffsets(stdout: *Writer, stderr: *Writer, locked: bool) !void {
         const append = stdout.append orelse stderr.append orelse return;
-        try append.lock();
-        defer append.unlock();
+        if (locked) try append.lock();
+        defer if (locked) append.unlock();
         const end = try append.file.length(append.io);
-        if (stdout.append != null) try append.io.vtable.fileSeekTo(append.io.userdata, stdout.file, end);
+        const stdout_sync = if (stdout.append != null) append.io.vtable.fileSeekTo(append.io.userdata, stdout.file, end) else {};
         if (stderr.append != null) try append.io.vtable.fileSeekTo(append.io.userdata, stderr.file, end);
+        try stdout_sync;
     }
 };
 
@@ -273,4 +326,79 @@ test "one shared output batch keeps its lock across short writes and ID terminat
     try std.testing.expect(backend.writes > 1);
     try std.testing.expectEqual(@as(usize, 2), writer.completed_ids);
     try std.testing.expectEqualStrings("url/sm1\npart\nsm2\n{\"msg\":\"other process\"}\n", collected.buffered());
+}
+
+test "record rollback happens before unlock and a successor refuses an orphaned prefix" {
+    const Backend = struct {
+        bytes: [64]u8 = undefined,
+        len: usize = 0,
+        locked: bool = false,
+        writes: usize = 0,
+        fail_rollback: bool,
+
+        fn cast(context: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(context.?));
+        }
+        fn lock(context: ?*anyopaque, _: Io.File, _: Io.File.Lock) Io.File.LockError!void {
+            std.debug.assert(!cast(context).locked);
+            cast(context).locked = true;
+        }
+        fn unlock(context: ?*anyopaque, _: Io.File) void {
+            cast(context).locked = false;
+        }
+        fn length(context: ?*anyopaque, _: Io.File) Io.File.LengthError!u64 {
+            return cast(context).len;
+        }
+        fn read(context: ?*anyopaque, _: Io.File, data: []const []u8, offset: u64) Io.File.ReadPositionalError!usize {
+            const self = cast(context);
+            const start: usize = @intCast(offset);
+            const n = @min(data[0].len, self.len - start);
+            @memcpy(data[0][0..n], self.bytes[start..][0..n]);
+            return n;
+        }
+        fn write(context: ?*anyopaque, _: Io.File, _: []const u8, data: []const []const u8, _: usize, offset: u64) Io.File.WritePositionalError!usize {
+            const self = cast(context);
+            std.debug.assert(self.locked and offset == self.len);
+            self.writes += 1;
+            if (self.writes == 2) return error.NoSpaceLeft;
+            const n = if (self.writes == 1) 3 else data[0].len;
+            @memcpy(self.bytes[self.len..][0..n], data[0][0..n]);
+            self.len += n;
+            return n;
+        }
+        fn resize(context: ?*anyopaque, _: Io.File, size: u64) Io.File.SetLengthError!void {
+            const self = cast(context);
+            std.debug.assert(self.locked);
+            if (self.fail_rollback) return error.AccessDenied;
+            self.len = @intCast(size);
+        }
+    };
+    var vtable = Io.failing.vtable.*;
+    vtable.fileLock = Backend.lock;
+    vtable.fileUnlock = Backend.unlock;
+    vtable.fileLength = Backend.length;
+    vtable.fileReadPositional = Backend.read;
+    vtable.fileWritePositional = Backend.write;
+    vtable.fileSetLength = Backend.resize;
+    const previous = "{\"previous\":1}\n";
+    for ([_]bool{ false, true }) |fail_rollback| {
+        var backend: Backend = .{ .fail_rollback = fail_rollback, .len = previous.len };
+        @memcpy(backend.bytes[0..previous.len], previous);
+        const io: Io = .{ .userdata = &backend, .vtable = &vtable };
+        var first: AppendFile = .{ .io = io, .file = .stdout() };
+        var next: AppendFile = .{ .io = io, .file = .stdout() };
+        var sent: usize = 0;
+        const expected: anyerror = if (fail_rollback) error.LogRecordRollbackFailed else error.NoSpaceLeft;
+        try std.testing.expectError(expected, first.writeRecord("{\"first\":1}\n", &sent));
+        try std.testing.expect(!backend.locked);
+        var next_sent: usize = 0;
+        if (fail_rollback) {
+            try std.testing.expectError(error.IncompleteLogRecord, next.writeRecord("{\"next\":1}\n", &next_sent));
+            try std.testing.expectEqualStrings(previous ++ "{\"f", backend.bytes[0..backend.len]);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), sent);
+            try next.writeRecord("{\"next\":1}\n", &next_sent);
+            try std.testing.expectEqualStrings(previous ++ "{\"next\":1}\n", backend.bytes[0..backend.len]);
+        }
+    }
 }
