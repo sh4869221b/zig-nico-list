@@ -707,6 +707,109 @@ class CliIntegration(unittest.TestCase):
         self.assertEqual([record['msg'] for record in records],
                          ['http_attempt', 'video list', 'http_metrics'])
 
+    @unittest.skipUnless(os.name == 'posix' and Path('/dev/stderr').exists(), 'requires Unix stderr')
+    def test_logfile_reuses_an_inherited_unix_socket(self):
+        with fixture() as server, contextlib.ExitStack() as stack:
+            reader, writer = socket.socketpair()
+            stack.enter_context(reader)
+            stack.enter_context(writer)
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            result = subprocess.run([BINARY, '--no-progress', '-P2', '--http-metrics',
+                                     '--logfile', '/dev/stderr', USER],
+                                    stdout=subprocess.PIPE, stderr=writer, env=env, timeout=5)
+            writer.close()
+            reader.settimeout(5)
+            with reader.makefile('rb') as stream:
+                diagnostics = stream.read().splitlines()
+            self.assertEqual(result.returncode, 0, diagnostics)
+            self.assertEqual(result.stdout, b'sm2\nsm10\n')
+            self.assertEqual([json.loads(line)['msg'] for line in diagnostics if line.startswith(b'{')],
+                             ['http_attempt', 'video list', 'http_metrics'])
+            self.assertTrue(any(line.startswith(b'summary ') for line in diagnostics))
+
+    def test_multiline_id_counts_as_one_result_in_all_modes(self):
+        with fixture(lambda *_: (200, body(('sm1\npart', 'sm2')), {}, False)) as server:
+            for flags in ([], ['--no-sort'], ['--json'], ['--no-sort', '--json']):
+                with self.subTest(flags=flags):
+                    result = command(server, '-P2', *flags, USER)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('output_count=2\n', result.stderr)
+                    if '--json' in flags:
+                        self.assertCountEqual(json.loads(result.stdout)['items'], ['sm1\npart', 'sm2'])
+                    else:
+                        self.assertCountEqual(result.stdout.splitlines(), ['sm1', 'part', 'sm2'])
+
+    def test_shared_regular_file_keeps_large_id_records_whole(self):
+        ids = ['sm' + str(i) * 66000 for i in range(8)]
+        payload = body(ids)
+        with tempfile.TemporaryDirectory() as tmp, fixture(
+                lambda *_: (200, payload, {}, False)) as server, contextlib.ExitStack() as stack:
+            path = Path(tmp) / 'shared.log'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            shared = stack.enter_context(path.open('wb'))
+            children = [stack.enter_context(subprocess.Popen(
+                [BINARY, '--no-progress', '-P2', '--http-metrics', '--logfile', str(path),
+                 *(['--no-sort'] if i % 2 else []), USER],
+                stdout=shared, stderr=subprocess.PIPE, env=env)) for i in range(6)]
+            try:
+                for child in children:
+                    _, stderr = child.communicate(timeout=8)
+                    self.assertEqual(child.returncode, 0, stderr)
+                    self.assertIn(b'output_count=8', stderr)
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+            lines = path.read_text().splitlines()
+            self.assertEqual(sorted(line for line in lines if not line.startswith('{')), sorted(ids * len(children)))
+            self.assertCountEqual([json.loads(line)['msg'] for line in lines if line.startswith('{')],
+                                  ['http_attempt', 'video list', 'http_metrics'] * len(children))
+
+    @unittest.skipUnless(sys.platform == 'linux', 'requires Linux prlimit')
+    def test_partial_trace_resumes_without_replaying_its_prefix(self):
+        import resource
+        let_request_finish = threading.Event()
+        request_started = threading.Event()
+
+        def reply(page, attempt, path):
+            if attempt == 1:
+                request_started.set()
+                let_request_finish.wait(5)
+                return 429, b'', {'Retry-After': '2'}, False
+            return 200, body(('sm1',)), {}, False
+
+        with fixture(reply) as server, tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'trace.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            # Keep the process alive when the kernel rejects the next write at the limit.
+            launcher = 'import os,signal,sys; signal.signal(signal.SIGXFSZ, signal.SIG_IGN); os.execv(sys.argv[1], sys.argv[1:])'
+            with subprocess.Popen(
+                    [sys.executable, '-c', launcher, BINARY, '--no-progress', '-P2',
+                     '--http-metrics', '--logfile', str(log), USER],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                try:
+                    self.assertTrue(request_started.wait(3))
+                    old_limit = resource.prlimit(proc.pid, resource.RLIMIT_FSIZE)
+                    resource.prlimit(proc.pid, resource.RLIMIT_FSIZE, (150, old_limit[1]))
+                    let_request_finish.set()
+                    until = time.monotonic() + 2
+                    while log.stat().st_size < 150 and time.monotonic() < until:
+                        time.sleep(.01)
+                    self.assertEqual(log.stat().st_size, 150)
+                    self.assertFalse(log.read_bytes().endswith(b'\n'))
+                    time.sleep(.15)
+                    resource.prlimit(proc.pid, resource.RLIMIT_FSIZE, old_limit)
+                    stdout, stderr = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, 0, stderr)
+                    self.assertEqual(stdout, b'sm1\n')
+                finally:
+                    let_request_finish.set()
+                    if proc.poll() is None:
+                        proc.kill()
+            records = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual([(row['attempt']['request_id'], row['attempt']['status'])
+                              for row in records if row['msg'] == 'http_attempt'], [(1, 429), (2, 200)])
+
     @unittest.skipUnless(Path('/dev/stderr').exists(), 'requires /dev/stderr')
     def test_logfile_and_summary_append_to_the_same_regular_stderr(self):
         with tempfile.TemporaryDirectory() as tmp, fixture() as server:
