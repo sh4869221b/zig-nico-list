@@ -83,9 +83,10 @@ attempt numbers, and an invocation-local unique `request_id` (dispatch order).
   `body_bytes` counts complete bodies retained for JSON parsing, after
   decompression when applicable.
   The output task can emit timeout diagnostics while an earlier page is
-  still retrying. The final report resumes pending timeout and cancellation
-  records after the last completed record if earlier delivery was interrupted.
-  Use `request_id` to correlate attempt records.
+  still retrying. The final report resumes pending records, including
+  ordinary attempt traces whose write was interrupted. It flushes the
+  summary before sending aggregate HTTP metrics, including when the two
+  use different streams. Use `request_id` to correlate attempt records.
 - `service_ns` and all phase timings sum concurrent attempt durations, so they
   can exceed wall time. Semaphore/rate/backoff remain separate aggregate fields;
   `backoff_wait_ns` is scheduled retry delay, not measured sleep or shared cooldown.

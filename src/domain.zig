@@ -780,8 +780,14 @@ pub fn fetchPage(ctx: *Context, target: cli.Target, number: usize) !Fetched {
                 return err;
             }
         }
-        try check(ctx.io, ctx.deadline);
-        if (ctx.cfg.http_metrics) if (ctx.trace_fn) |f| f(ctx.log_context, attempt_info.trace);
+        if (ctx.cfg.http_metrics) {
+            if (isAborted(ctx.deadline)) {
+                // This attempt has an outcome, even when the worker is
+                // already canceled before it can enter the diagnostic writer.
+                if (ctx.terminal_diagnostic_fn) |f|
+                    f(ctx.log_context, .{ .body_error = null, .trace = attempt_info.trace });
+            } else if (ctx.trace_fn) |f| f(ctx.log_context, attempt_info.trace);
+        }
         try check(ctx.io, ctx.deadline);
         retry_cause = if (transport_error) .transport else switch (status) {
             403 => .http_403,

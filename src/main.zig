@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const cli = @import("cli.zig");
 const domain = @import("domain.zig");
 const scheduler = @import("scheduler.zig");
+const stdio = @import("stdio.zig");
 const Io = std.Io;
 const version = "v0.04";
 var interrupted: std.atomic.Value(bool) = .init(false);
@@ -21,13 +22,17 @@ pub fn main(init: std.process.Init) void {
     }
     var stdout_buffer: [65536]u8 = undefined;
     var stderr_buffer: [4096]u8 = undefined;
-    var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
-    const inherited_stderr = Io.File.stderr();
-    var stderr = inherited_stderr.writerStreaming(init.io, &stderr_buffer);
-    const result = run(init, &stdout.interface, &stderr);
+    var stdout: stdio.Writer = .init(init.io, .stdout(), &stdout_buffer);
+    var stderr: stdio.Writer = .init(init.io, .stderr(), &stderr_buffer);
+    var logfile: ?stdio.AppendFile = null;
+    const result = run(init, &stdout, &stderr, &logfile);
     const flush: FinalFlush = .{ .out = &stdout.interface, .err = &stderr.interface, .result = result };
-    const status = superviseFinalWrite(init.io, FinalFlush.run, .{flush}) catch 1;
-    if (stderr.file.handle != inherited_stderr.handle) stderr.file.close(init.io);
+    var status = superviseFinalWrite(init.io, FinalFlush.run, .{flush}) catch 1;
+    if (stdout.append != null or stderr.append != null)
+        superviseFinalWrite(init.io, stdio.Writer.syncInheritedOffsets, .{ &stdout, &stderr }) catch {
+            status = 1;
+        };
+    if (logfile) |file| file.file.close(init.io);
     if (status != 0) std.process.exit(status);
 }
 
@@ -48,32 +53,9 @@ const Log = struct {
     io: Io,
     err: *Io.Writer,
     file: ?Io.File,
-    append: bool,
+    append: ?*stdio.AppendFile,
     buffer: Io.Writer.Allocating,
     mutex: Io.Mutex = .init,
-
-    extern "kernel32" fn GetFileType(handle: std.os.windows.HANDLE) callconv(.winapi) u32;
-
-    fn isRegularFile(io: Io, file: Io.File) !bool {
-        if (builtin.os.tag == .windows) {
-            // FILE_TYPE_DISK also works with the write-only logfile handle.
-            return GetFileType(file.handle) == 1;
-        }
-        const stat = file.stat(io) catch |err| switch (err) {
-            error.Streaming => return false,
-            else => return err,
-        };
-        return stat.kind == .file;
-    }
-
-    fn appendStderr(writer: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-        const stderr: *Io.File.Writer = @fieldParentPtr("interface", writer);
-        const file = stderr.file;
-        file.lock(stderr.io, .exclusive) catch return error.WriteFailed;
-        defer file.unlock(stderr.io);
-        stderr.pos = file.length(stderr.io) catch return error.WriteFailed;
-        return Io.File.Writer.drain(writer, data, splat);
-    }
 
     fn writeRecord(self: *Log, comptime encode: anytype, args: anytype) !void {
         try self.mutex.lock(self.io);
@@ -82,11 +64,8 @@ const Log = struct {
         if (self.file) |file| {
             defer self.buffer.clearRetainingCapacity();
             try @call(.auto, encode, .{&self.buffer.writer} ++ args);
-            if (self.append) {
-                // Hold the file lock through the EOF lookup and any short writes.
-                try file.lock(self.io, .exclusive);
-                defer file.unlock(self.io);
-                try file.writePositionalAll(self.io, self.buffer.written(), try file.length(self.io));
+            if (self.append) |append| {
+                try append.writeAll(self.buffer.written());
             } else {
                 try file.writeStreamingAll(self.io, self.buffer.written());
             }
@@ -140,7 +119,7 @@ const Runner = struct {
     init: std.process.Init,
     cfg: *cli.Config,
     ctx: domain.Context,
-    out: *Io.Writer,
+    out: *stdio.Writer,
     err: *Io.Writer,
     diagnostics: Log,
     terminal_mutex: Io.Mutex = .init,
@@ -187,7 +166,9 @@ const Runner = struct {
     }
     fn trace(context: ?*anyopaque, value: domain.AttemptTrace) void {
         const self: *Runner = @ptrCast(@alignCast(context.?));
-        self.diagnostics.writeRecord(Log.attempt, .{value}) catch {};
+        self.diagnostics.writeRecord(Log.attempt, .{value}) catch {
+            queueTerminalDiagnostic(context, .{ .body_error = null, .trace = value });
+        };
     }
 
     fn queueTerminalDiagnostic(context: ?*anyopaque, diagnostic: domain.TerminalDiagnostic) void {
@@ -195,8 +176,7 @@ const Runner = struct {
         self.terminal_mutex.lockUncancelable(self.init.io);
         defer self.terminal_mutex.unlock(self.init.io);
         self.terminal_diagnostics.pushBack(self.init.gpa, diagnostic) catch {};
-        // The page returns immediately after handing off this record. Its
-        // completion notification also wakes the coordinator for diagnostics.
+        // A canceled or expired page wakes the coordinator as it completes.
     }
 
     fn hasTerminalDiagnostics(context: *anyopaque) bool {
@@ -244,8 +224,8 @@ const Runner = struct {
         // Committed streaming results reach stdout before this event can
         // wait for a diagnostic writer or logfile lock.
         if (self.cfg.no_sort and !self.cfg.json and self.output_error == null) {
+            const out = &self.out.interface;
             var write_failed = false;
-            var count: usize = 0;
             for (result.items) |id| {
                 if (self.cfg.dedupe) {
                     const item = self.seen.getOrPut(self.ctx.result_allocator, id) catch |err| {
@@ -258,20 +238,20 @@ const Runner = struct {
                         break;
                     };
                 }
-                cli.writeLines(self.out, &.{id}, self.cfg.url) catch |err| {
+                cli.writeLines(out, &.{id}, self.cfg.url) catch |err| {
                     self.output_error = err;
                     write_failed = true;
                     break;
                 };
-                count += 1;
             }
-            if (!write_failed) self.out.flush() catch |err| {
+            if (!write_failed) out.flush() catch |err| {
                 self.output_error = err;
                 write_failed = true;
             };
             // A failed/canceled write may retain buffered bytes. Retrying them
             // in run/main would block again after a graceful interrupt.
-            if (write_failed) self.out.end = 0 else self.output_count += count;
+            if (write_failed) out.end = 0;
+            self.output_count = self.out.lines;
             if (self.output_error != null) domain.canceled.store(true, .release);
         }
         if (!domain.canceled.load(.acquire) and !self.terminal_delivery_paused) self.emitTerminalDiagnostics();
@@ -292,6 +272,7 @@ const Runner = struct {
         try self.diagnostics.writeRecord(Log.videoList, .{self.output_count});
         if (self.show_progress) try self.err.writeByte('\n');
         try self.err.print("summary inputs={d} valid={d} invalid={d} fetch_ok={d} fetch_err={d} output_count={d}\n", .{ counts.total, counts.valid, counts.invalid, self.fetch_ok, self.fetch_err, self.output_count });
+        try self.err.flush();
         if (self.cfg.http_metrics) try self.diagnostics.writeRecord(Log.metrics, .{self.ctx.control});
         if (output_error) |e| return fail(self.err, @errorName(e));
         if (cli.exitMessage(self.cfg.*, counts.invalid, input_error, self.first_error)) |message| return fail(self.err, message);
@@ -351,8 +332,9 @@ fn fail(err: *Io.Writer, text: []const u8) !u8 {
     try err.print("Error: {s}\n", .{text});
     return 1;
 }
-fn run(init: std.process.Init, out: *Io.Writer, stderr: *Io.File.Writer) !u8 {
+fn run(init: std.process.Init, stdout: *stdio.Writer, stderr: *stdio.Writer, logfile: *?stdio.AppendFile) !u8 {
     const a = init.arena.allocator();
+    const out = &stdout.interface;
     const err = &stderr.interface;
     const args = try init.minimal.args.toSlice(a);
     var parsed = try cli.parse(a, args[1..]);
@@ -371,23 +353,17 @@ fn run(init: std.process.Init, out: *Io.Writer, stderr: *Io.File.Writer) !u8 {
     const cfg = &parsed.config;
     if (init.environ_map.get("NICO_BASE_URL")) |url| cfg.base_url = std.mem.trimEnd(u8, url, "/");
     if (try cli.validate(a, cfg)) |message| return superviseFinalWrite(init.io, fail, .{ err, message });
-    const aliases_stderr = (builtin.os.tag == .linux or builtin.os.tag == .macos) and std.mem.eql(u8, cfg.logfile, "/dev/stderr");
-    const append_stderr = aliases_stderr and try Log.isRegularFile(init.io, stderr.file);
-    const logfile = if (cfg.logfile.len > 0 and (!aliases_stderr or append_stderr))
-        Io.Dir.cwd().createFile(init.io, cfg.logfile, .{ .truncate = false }) catch |e|
-            return superviseFinalWrite(init.io, fail, .{ err, try std.fmt.allocPrint(a, "open {s}: {s}", .{ cfg.logfile, @errorName(e) }) })
-    else
-        null;
-    defer if (!append_stderr) {
-        if (logfile) |file| file.close(init.io);
-    };
-    if (append_stderr) {
-        // JSONL and text share the same destination. Append all text writes
-        // under the same file lock. Main keeps this handle through its final flush.
-        stderr.file = logfile.?;
-        stderr.mode = .positional;
-        stderr.interface.vtable = &.{ .drain = Log.appendStderr };
+    var append: ?*stdio.AppendFile = null;
+    if (cfg.logfile.len > 0) {
+        const file = Io.Dir.cwd().createFile(init.io, cfg.logfile, .{ .truncate = false }) catch |e|
+            return superviseFinalWrite(init.io, fail, .{ err, try std.fmt.allocPrint(a, "open {s}: {s}", .{ cfg.logfile, @errorName(e) }) });
+        logfile.* = .{ .io = init.io, .file = file };
+        if (try stdio.isRegular(init.io, file)) {
+            append = &logfile.*.?;
+            append.?.bind(stdout, stderr);
+        }
     }
+    stdout.count_lines = cfg.no_sort and !cfg.json;
     var control = domain.Control.init(init.io, cfg);
     var client: HttpClient = .{ .allocator = init.gpa, .io = init.io };
     defer client.deinit();
@@ -400,13 +376,13 @@ fn run(init: std.process.Init, out: *Io.Writer, stderr: *Io.File.Writer) !u8 {
     var runner: Runner = .{
         .init = init,
         .cfg = cfg,
-        .out = out,
+        .out = stdout,
         .err = err,
         .diagnostics = .{
             .io = init.io,
             .err = err,
-            .file = logfile,
-            .append = append_stderr or if (logfile) |file| try Log.isRegularFile(init.io, file) else false,
+            .file = if (logfile.*) |file| file.file else null,
+            .append = append,
             .buffer = .init(init.gpa),
         },
         .ctx = .{ .result_allocator = a, .temporary = init.gpa, .io = init.io, .cfg = cfg, .control = &control, .client = &client },
@@ -494,7 +470,7 @@ test "terminal diagnostics resume after the last completed record" {
         .ctx = undefined,
         .out = undefined,
         .err = &writer.interface,
-        .diagnostics = .{ .io = io, .err = &writer.interface, .file = null, .append = false, .buffer = .init(a) },
+        .diagnostics = .{ .io = io, .err = &writer.interface, .file = null, .append = null, .buffer = .init(a) },
         .show_progress = false,
     };
     defer runner.terminal_diagnostics.deinit(a);

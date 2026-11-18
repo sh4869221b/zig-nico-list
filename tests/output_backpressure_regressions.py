@@ -5,6 +5,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import select
 import socket
@@ -185,6 +186,8 @@ class OutputBackpressureTests(unittest.TestCase):
             self.assertTrue(closed_before_drain)
             self.assertEqual(proc.returncode, 1, stderr)
             self.assertLess(len(stdout), sum(len(value) + 1 for value in IDS))
+            self.assertGreater(stdout.count(b'\n'), 0)
+            self.assertEqual(int(re.search(rb'\boutput_count=(\d+)', stderr)[1]), stdout.count(b'\n'))
             self.assertIn(b'Error: WriteFailed', stderr)
             self.assertNotIn(b'"error":"Timeout"', stderr)
 

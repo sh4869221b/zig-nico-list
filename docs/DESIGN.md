@@ -73,6 +73,11 @@ sink before releasing borrowed page memory or emitting another event. With
 its diagnostics. Diagnostic mutex acquisition and writes can be canceled.
 Caller cancellation releases a blocked sink before the coordinator joins
 other pages. Failed stdout writes are not retried during cleanup.
+For streaming line output, the summary counts newlines accepted by the OS
+before interruption, including complete lines from a partially written target.
+If the logfile and a standard stream share a regular file, the sink uses
+locked appends for both and advances the matching inherited offsets to EOF
+after the final flush.
 After fetching finishes, sorted line output and JSON serialization plus their
 final flush run in an awaited output task. The final diagnostics and stream
 flushes use the same signal polling, so full stdout and stderr pipes remain
@@ -91,7 +96,9 @@ starting and sending another request. Workers hand off timeout and
 cancellation diagnostics in memory and wake the coordinator as they finish.
 The sink can emit these diagnostics before the target completes. When the
 sink is interrupted, it leaves pending records for the final report and
-keeps track of which records have already been delivered.
+keeps track of which records have already been delivered. A normal attempt
+whose diagnostic write is interrupted also hands its trace to the final
+report. Each attempt supplies one trace with its original request ID.
 Client timeout stays Timeout for
 adaptive overload feedback and is propagated as a terminal page failure. It is
 not retried inside the canceled page future: the supervisor is joining that
