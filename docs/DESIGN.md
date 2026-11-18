@@ -51,8 +51,10 @@ Retry/cooldown readiness is checked before HTTP admission; the rate wait after
 admission only reserves the next pacing slot and checks cancellation.
 
 The scheduler assembles page results in page-number order even when they finish
-out of order. The earliest terminal page determines the valid prefix. A later
-page failure or timeout cannot erase an earlier valid terminal result.
+out of order. The earliest terminal page determines the valid prefix. Observing
+a terminal page cancels jobs with higher page numbers, including retries that
+are still waiting on Retry-After. Lower page numbers can still contribute
+results or establish an earlier end to the prefix.
 
 ## Deadlines and cancellation
 
@@ -71,9 +73,10 @@ event. The sink releases the diagnostic mutex before writing stdout, so canceled
 HTTP jobs can log and finish independently. Caller cancellation also cancels a
 blocked sink; failed writes are not flushed again from a later cleanup path.
 After fetching finishes, sorted line output and JSON serialization plus their
-final flush run in one awaited output task with the same signal polling. A full
-stdout pipe therefore remains interruptible through the end of the command;
-failed final writes also discard retained writer bytes before cleanup.
+final flush run in an awaited output task. The final diagnostics and stream
+flushes use the same signal polling, so full stdout and stderr pipes remain
+interruptible at shutdown. Failed final writes discard retained writer bytes
+before cleanup.
 Final-output interruption watches a separate signal flag. Input-read errors stop
 fetching through the shared shutdown flag, but completed results are fully
 written before reporting that input error. SIGINT/SIGTERM can still interrupt
@@ -147,9 +150,11 @@ The previous port differed on two documented cases. These are fixes toward the
 original contract, not deleted features.
 
 Successful HTTP response bodies are buffered up to 8 MiB, inclusive, independent
-of Content-Length or framing. Larger bodies fail with ResponseBodyTooLarge
-without decoding, retrying, or draining the remaining body; earlier committed
-pages remain available through the existing partial-result contract.
+of Content-Length or framing. For gzip and deflate this limit applies to the
+decompressed body. The client verifies the compression footer and completes
+HTTP framing before parsing JSON. Larger bodies fail with ResponseBodyTooLarge
+and earlier committed pages remain available through the partial-result contract.
+The client closes the rejected response immediately.
 The HTTP response itself is still fully buffered within that limit. "Token projection" refers to
 parsing that buffer without full schema/DOM materialization; it is not claimed
 to stream raw network bytes directly into the final output.

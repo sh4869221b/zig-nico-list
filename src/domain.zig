@@ -383,7 +383,6 @@ fn requestOnce(ctx: *Context, url: []const u8, attempt_info: *Attempt, fresh: bo
     var req = ctx.client.request(.GET, uri, .{
         .connection = pooled,
         .force_new_connection = fresh,
-        .headers = .{ .accept_encoding = .omit },
         .extra_headers = &.{ .{ .name = "X-Frontend-Id", .value = "6" }, .{ .name = "Accept", .value = "*/*" } },
         .redirect_behavior = .init(10),
     }) catch |err| {
@@ -446,8 +445,7 @@ fn requestOnce(ctx: *Context, url: []const u8, attempt_info: *Attempt, fresh: bo
     }
     trace.phase = .body;
     phase_started = now(ctx.io);
-    var transfer: [16384]u8 = undefined;
-    const body = res.reader(&transfer).allocRemaining(ctx.temporary, .limited(max_page_body_bytes)) catch |err| {
+    const body = readPageBody(ctx.temporary, &res) catch |err| {
         // Never drain or reuse a response rejected before its framing ends.
         if (req.connection) |connection| connection.closing = true;
         return .{
@@ -456,19 +454,61 @@ fn requestOnce(ctx: *Context, url: []const u8, attempt_info: *Attempt, fresh: bo
             .body_error = if (err == error.StreamTooLong) error.ResponseBodyTooLarge else err,
         };
     };
-    // allocRemaining accepts EOF, including a premature EOF from Zig's HTTP
-    // body reader. Do not accept a valid JSON prefix until HTTP framing ends.
-    switch (req.reader.state) {
-        .body_remaining_content_length, .body_remaining_chunk_len => {
-            ctx.temporary.free(body);
-            return .{ .status = status, .body = try ctx.temporary.alloc(u8, 0), .body_error = error.TruncatedResponseBody };
-        },
-        else => {}, // EOF is the delimiter for body_none.
-    }
     trace.body_ns = now(ctx.io) - phase_started;
     trace.phase = .complete;
     return .{ .status = status, .body = body, .retry_after = retry_after };
 }
+
+fn readPageBody(allocator: Allocator, response: *HttpClient.Response) ![]u8 {
+    const encoding = response.head.content_encoding;
+    var transfer: [16384]u8 = undefined;
+    const wire = response.reader(&transfer);
+    const body = switch (encoding) {
+        .identity => try wire.allocRemaining(allocator, .limited(max_page_body_bytes)),
+        .gzip => try readCompressedPageBody(allocator, wire, .gzip),
+        .deflate => try readCompressedPageBody(allocator, wire, .zlib),
+        else => return error.HttpContentEncodingUnsupported,
+    };
+    errdefer allocator.free(body);
+    // The HTTP reader can return EOF before the declared Content-Length.
+    return switch (response.request.reader.state) {
+        .ready, .body_none => body,
+        else => error.TruncatedResponseBody,
+    };
+}
+
+fn readCompressedPageBody(allocator: Allocator, wire: *Io.Reader, container: std.compress.flate.Container) ![]u8 {
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    while (true) {
+        const member_start = decoded.items.len;
+        var decoder: std.compress.flate.Decompress = .init(wire, container, &window);
+        decoder.reader.appendRemaining(allocator, &decoded, .limited(max_page_body_bytes + 1 - member_start)) catch |err| {
+            if (err == error.ReadFailed and decoder.err != null and decoder.err.? != error.ReadFailed)
+                return error.InvalidCompressedResponseBody;
+            return err;
+        };
+        // Zig exposes the footer but leaves validation to callers.
+        const member = decoded.items[member_start..];
+        const valid = switch (decoder.container_metadata) {
+            .gzip => |footer| footer.count == member.len and footer.crc == std.hash.Crc32.hash(member),
+            .zlib => |footer| footer.adler == std.hash.Adler32.hash(member),
+            .raw => unreachable,
+        };
+        if (!valid) return error.InvalidCompressedResponseBody;
+
+        // Reading through the framing terminator also consumes chunked trailers.
+        _ = wire.peekByte() catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        // A gzip stream may contain several members. Deflate carries one zlib stream.
+        if (container != .gzip) return error.InvalidCompressedResponseBody;
+    }
+    return decoded.toOwnedSlice(allocator);
+}
+
 fn requestTimed(ctx: *Context, url: []const u8, attempt_info: *Attempt) !Response {
     const deadline = ctx.deadline orelse return error.MissingDeadlineOwner;
     const expires = now(ctx.io) +| ctx.cfg.timeout_ns;
@@ -499,29 +539,52 @@ fn requestTimed(ctx: *Context, url: []const u8, attempt_info: *Attempt) !Respons
 }
 
 pub fn retryAfter(io: Io, raw: []const u8) i64 {
-    const value = std.mem.trim(u8, raw, " \t\r\n");
-    if (std.fmt.parseInt(i64, value, 10)) |seconds| return @max(0, seconds) *| 1_000_000_000 else |_| {}
-    // RFC 7231 IMF-fixdate. Obsolete HTTP-date variants are also accepted below.
+    const value = std.mem.trim(u8, raw, " \t");
+    if (isDecimal(value)) {
+        const seconds = std.fmt.parseInt(i64, value, 10) catch return 0;
+        return seconds *| 1_000_000_000;
+    }
     const ts = parseHTTPDate(value) catch return 0;
     const real: i64 = @intCast(Io.Timestamp.now(io, .real).toNanoseconds());
     return @max(0, ts *| 1_000_000_000 -| real);
 }
+
+fn isDecimal(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
 fn parseHTTPDate(value: []const u8) !i64 {
-    // IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
-    var words = std.mem.tokenizeAny(u8, value, " ,-");
-    _ = words.next() orelse return error.InvalidDate;
-    var day = words.next() orelse return error.InvalidDate;
-    var month = words.next() orelse return error.InvalidDate;
-    var year = words.next() orelse return error.InvalidDate;
-    var time = words.next() orelse return error.InvalidDate;
-    if (std.ascii.isAlphabetic(day[0])) {
-        const old_month = day;
-        day = month;
-        month = old_month;
-        const old_time = year;
-        year = time;
-        time = old_time;
+    const ShortDay = enum { Mon, Tue, Wed, Thu, Fri, Sat, Sun };
+    const LongDay = enum { Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday };
+    if (std.mem.indexOfScalar(u8, value, ',')) |comma| {
+        const weekday = value[0..comma];
+        const rest = value[comma + 1 ..];
+        if (!std.mem.endsWith(u8, rest, " GMT")) return error.InvalidDate;
+
+        // IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
+        if (std.meta.stringToEnum(ShortDay, weekday) != null) {
+            if (rest.len != 25 or rest[0] != ' ' or rest[3] != ' ' or rest[7] != ' ' or rest[12] != ' ')
+                return error.InvalidDate;
+            return parseHTTPDateFields(rest[1..3], rest[4..7], rest[8..12], rest[13..21]);
+        }
+        // RFC 850: Sunday, 06-Nov-94 08:49:37 GMT
+        if (std.meta.stringToEnum(LongDay, weekday) == null or rest.len != 23 or
+            rest[0] != ' ' or rest[3] != '-' or rest[7] != '-' or rest[10] != ' ')
+            return error.InvalidDate;
+        return parseHTTPDateFields(rest[1..3], rest[4..7], rest[8..10], rest[11..19]);
     }
+
+    // asctime: Sun Nov  6 08:49:37 1994
+    if (value.len != 24 or std.meta.stringToEnum(ShortDay, value[0..3]) == null or
+        value[3] != ' ' or value[7] != ' ' or value[10] != ' ' or value[19] != ' ')
+        return error.InvalidDate;
+    return parseHTTPDateFields(if (value[8] == ' ') value[9..10] else value[8..10], value[4..7], value[20..24], value[11..19]);
+}
+
+fn parseHTTPDateFields(day: []const u8, month: []const u8, year: []const u8, time: []const u8) !i64 {
+    if (!isDecimal(day) or !isDecimal(year) or time[2] != ':' or time[5] != ':') return error.InvalidDate;
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     var month_no: usize = 0;
     for (months, 1..) |m, i| if (std.mem.eql(u8, m, month)) {
@@ -734,10 +797,25 @@ pub fn errorMessage(allocator: Allocator, err: anyerror) []const u8 {
     if (std.mem.startsWith(u8, name, "Http")) return std.fmt.allocPrint(allocator, "unexpected status: {s}", .{name[4..]}) catch name;
     return name;
 }
-test "HTTP Retry-After IMF date" {
+test "HTTP Retry-After accepts decimal delays and all HTTP date formats" {
+    try std.testing.expectEqual(@as(i64, 2_000_000_000), retryAfter(std.testing.io, "\t02 "));
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sun, 06 Nov 1994 08:49:37 GMT"));
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sunday, 06-Nov-94 08:49:37 GMT"));
     try std.testing.expectEqual(@as(i64, 784111777), try parseHTTPDate("Sun Nov  6 08:49:37 1994"));
+}
+
+test "HTTP Retry-After rejects malformed decimals and timezones" {
+    for ([_][]const u8{ "", "0_2", "+2", "-2" }) |value| {
+        try std.testing.expectEqual(@as(i64, 0), retryAfter(std.testing.io, value));
+    }
+    for ([_][]const u8{
+        "Sun, 06 Nov 1994 08:49:37",
+        "Sun, 06 Nov 1994 08:49:37 GMT extra",
+        "Sun, 06 Nov 1994 08:49:37 UTC",
+        "Sunday, 06-Nov-94 08:49:37 PST",
+        "Sun Nov  6 08:49:37 1994 GMT",
+        "Sun, 0_6 Nov 1994 08:49:37 GMT",
+    }) |value| try std.testing.expectError(error.InvalidDate, parseHTTPDate(value));
 }
 
 test "rate-limit interval conversion saturates before the i64 boundary" {

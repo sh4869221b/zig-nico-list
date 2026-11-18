@@ -23,18 +23,75 @@ pub fn main(init: std.process.Init) void {
     var stderr_buffer: [4096]u8 = undefined;
     var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     var stderr = Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
-    const status = run(init, &stdout.interface, &stderr.interface) catch |err| blk: {
-        stderr.interface.print("Error: {s}\n", .{@errorName(err)}) catch {};
-        break :blk @as(u8, 1);
-    };
-    stdout.interface.flush() catch {
-        std.process.exit(1);
-    };
-    stderr.interface.flush() catch {
-        std.process.exit(1);
-    };
+    const result = run(init, &stdout.interface, &stderr.interface);
+    const flush: FinalFlush = .{ .out = &stdout.interface, .err = &stderr.interface, .result = result };
+    const status = superviseFinalWrite(init.io, FinalFlush.run, .{flush}) catch 1;
     if (status != 0) std.process.exit(status);
 }
+
+const FinalFlush = struct {
+    out: *Io.Writer,
+    err: *Io.Writer,
+    result: anyerror!u8,
+
+    fn run(self: FinalFlush) !u8 {
+        const status = self.result catch |err| try fail(self.err, @errorName(err));
+        try self.out.flush();
+        try self.err.flush();
+        return status;
+    }
+};
+
+const Log = struct {
+    io: Io,
+    err: *Io.Writer,
+    file: ?Io.File,
+    buffer: Io.Writer.Allocating,
+
+    fn writeRecord(self: *Log, comptime encode: anytype, args: anytype) !void {
+        if (self.file) |file| {
+            defer self.buffer.clearRetainingCapacity();
+            try @call(.auto, encode, .{&self.buffer.writer} ++ args);
+            // Hold the file lock through the EOF lookup and any short writes.
+            try file.lock(self.io, .exclusive);
+            defer file.unlock(self.io);
+            try file.writePositionalAll(self.io, self.buffer.written(), try file.length(self.io));
+        } else {
+            errdefer self.err.end = 0;
+            try @call(.auto, encode, .{self.err} ++ args);
+            try self.err.flush();
+        }
+    }
+
+    fn message(writer: *Io.Writer, level: []const u8, msg: []const u8, detail: []const u8) !void {
+        try writer.writeAll("{\"level\":");
+        try cli.writeJsonString(writer, level);
+        try writer.writeAll(",\"msg\":");
+        try cli.writeJsonString(writer, msg);
+        if (detail.len > 0) {
+            try writer.writeAll(if (std.mem.eql(u8, msg, "invalid input")) ",\"input\":" else ",\"error\":");
+            try cli.writeJsonString(writer, detail);
+        }
+        try writer.writeAll("}\n");
+    }
+
+    fn attempt(writer: *Io.Writer, value: domain.AttemptTrace) !void {
+        try writer.writeAll("{\"level\":\"INFO\",\"msg\":\"http_attempt\",\"attempt\":");
+        try std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, writer);
+        try writer.writeAll("}\n");
+    }
+
+    fn videoList(writer: *Io.Writer, count: usize) !void {
+        try writer.print("{{\"level\":\"INFO\",\"msg\":\"video list\",\"count\":{d}}}\n", .{count});
+    }
+
+    fn metrics(writer: *Io.Writer, control: *domain.Control) !void {
+        try writer.writeAll("{\"level\":\"INFO\",\"msg\":\"http_metrics\",\"http\":");
+        const snapshot = control.snapshot();
+        try std.json.Stringify.value(snapshot.jsonView(), .{ .emit_null_optional_fields = false }, writer);
+        try writer.writeAll("}\n");
+    }
+};
 
 const Runner = struct {
     init: std.process.Init,
@@ -42,7 +99,7 @@ const Runner = struct {
     ctx: domain.Context,
     out: *Io.Writer,
     err: *Io.Writer,
-    log_writer: *Io.Writer,
+    diagnostics: Log,
     mutex: Io.Mutex = .init,
     seen: std.StringHashMapUnmanaged(void) = .empty,
     completed: usize = 0,
@@ -68,7 +125,7 @@ const Runner = struct {
                 if (cli.parseTarget(input) != null) self.counts.valid += 1 else {
                     self.counts.invalid += 1;
                     try self.invalid.append(self.ctx.result_allocator, input);
-                    try self.logLocked("WARN", "invalid input", input);
+                    try self.diagnostics.writeRecord(Log.message, .{ "WARN", "invalid input", input });
                     self.completed += 1;
                     self.progress();
                 }
@@ -81,28 +138,13 @@ const Runner = struct {
         const self: *Runner = @ptrCast(@alignCast(context.?));
         self.mutex.lockUncancelable(self.init.io);
         defer self.mutex.unlock(self.init.io);
-        self.logLocked(level, message, detail) catch {};
+        self.diagnostics.writeRecord(Log.message, .{ level, message, detail }) catch {};
     }
     fn trace(context: ?*anyopaque, value: domain.AttemptTrace) void {
         const self: *Runner = @ptrCast(@alignCast(context.?));
         self.mutex.lockUncancelable(self.init.io);
         defer self.mutex.unlock(self.init.io);
-        self.log_writer.writeAll("{\"level\":\"INFO\",\"msg\":\"http_attempt\",\"attempt\":") catch return;
-        std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, self.log_writer) catch return;
-        self.log_writer.writeAll("}\n") catch return;
-        self.log_writer.flush() catch {};
-    }
-    fn logLocked(self: *Runner, level: []const u8, message: []const u8, detail: []const u8) !void {
-        try self.log_writer.writeAll("{\"level\":");
-        try cli.writeJsonString(self.log_writer, level);
-        try self.log_writer.writeAll(",\"msg\":");
-        try cli.writeJsonString(self.log_writer, message);
-        if (detail.len > 0) {
-            try self.log_writer.writeAll(if (std.mem.eql(u8, message, "invalid input")) ",\"input\":" else ",\"error\":");
-            try cli.writeJsonString(self.log_writer, detail);
-        }
-        try self.log_writer.writeAll("}\n");
-        try self.log_writer.flush();
+        self.diagnostics.writeRecord(Log.attempt, .{value}) catch {};
     }
     fn progress(self: *Runner) void {
         if (self.show_progress) {
@@ -118,7 +160,7 @@ const Runner = struct {
         if (result.error_message.len > 0) {
             self.fetch_err += 1;
             if (self.first_error == null) self.first_error = result.error_message;
-            self.logLocked("ERROR", "failed to get video list", result.error_message) catch {};
+            self.diagnostics.writeRecord(Log.message, .{ "ERROR", "failed to get video list", result.error_message }) catch {};
         } else self.fetch_ok += 1;
         self.mutex.unlock(self.init.io);
         // Only the sink task owns stdout, dedupe state and output counters.
@@ -159,28 +201,28 @@ const Runner = struct {
         self.completed += 1;
         self.progress();
     }
+
+    fn report(self: *Runner, input_error: ?[]const u8, output_error: ?anyerror) !u8 {
+        errdefer self.err.end = 0;
+        const counts = self.counts;
+        try self.diagnostics.writeRecord(Log.videoList, .{self.output_count});
+        if (self.show_progress) try self.err.writeByte('\n');
+        try self.err.print("summary inputs={d} valid={d} invalid={d} fetch_ok={d} fetch_err={d} output_count={d}\n", .{ counts.total, counts.valid, counts.invalid, self.fetch_ok, self.fetch_err, self.output_count });
+        if (self.cfg.http_metrics) try self.diagnostics.writeRecord(Log.metrics, .{self.ctx.control});
+        if (output_error) |e| return fail(self.err, @errorName(e));
+        if (cli.exitMessage(self.cfg.*, counts.invalid, input_error, self.first_error)) |message| return fail(self.err, message);
+        return 0;
+    }
 };
 
 const BufferedOutput = struct {
     allocator: std.mem.Allocator,
-    io: Io,
     out: *Io.Writer,
     cfg: cli.Config,
     counts: cli.Counts,
     invalid: []const []const u8,
     results: []const cli.TargetResult,
-    mutex: Io.Mutex = .init,
-    changed: Io.Condition = .init,
-    done: bool = false,
-
     fn run(self: *BufferedOutput) !usize {
-        const io = self.io;
-        defer {
-            self.mutex.lockUncancelable(io);
-            self.done = true;
-            self.changed.broadcast(io);
-            self.mutex.unlock(io);
-        }
         // Failed/canceled writes may retain bytes. Cleanup must not retry them
         // after the only task supervising stdout cancellation has been joined.
         errdefer self.out.end = 0;
@@ -188,24 +230,40 @@ const BufferedOutput = struct {
         try self.out.flush();
         return count;
     }
-
-    fn write(self: *BufferedOutput) !usize {
-        const io = self.io;
-        var future = try Io.concurrent(io, BufferedOutput.run, .{self});
-        while (true) {
-            self.mutex.lockUncancelable(io);
-            if (!self.done) self.changed.waitTimeout(io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
-            const done = self.done;
-            self.mutex.unlock(io);
-            if (done) return future.await(io);
-            // Input failures stop fetching but preserve completed output.
-            // Only an external signal cancels a blocked final write.
-            if (interrupted.load(.acquire)) return future.cancel(io);
-        }
-    }
 };
 
+fn superviseFinalWrite(io: Io, comptime write: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(write)).@"fn".return_type.?).error_union.payload {
+    const Result = @typeInfo(@TypeOf(write)).@"fn".return_type.?;
+    const Task = struct {
+        mutex: Io.Mutex = .init,
+        changed: Io.Condition = .init,
+        done: bool = false,
+
+        fn run(self: *@This(), task_io: Io, task_args: @TypeOf(args)) Result {
+            defer {
+                self.mutex.lockUncancelable(task_io);
+                self.done = true;
+                self.changed.signal(task_io);
+                self.mutex.unlock(task_io);
+            }
+            return @call(.auto, write, task_args);
+        }
+    };
+    var task: Task = .{};
+    var future = try Io.concurrent(io, Task.run, .{ &task, io, args });
+    while (true) {
+        task.mutex.lockUncancelable(io);
+        if (!task.done) task.changed.waitTimeout(io, &task.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
+        const done = task.done;
+        task.mutex.unlock(io);
+        if (done) return future.await(io);
+        // Input errors stop fetching. Only an external signal interrupts final writes.
+        if (interrupted.load(.acquire)) return future.cancel(io);
+    }
+}
+
 fn fail(err: *Io.Writer, text: []const u8) !u8 {
+    errdefer err.end = 0;
     try err.print("Error: {s}\n", .{text});
     return 1;
 }
@@ -213,7 +271,7 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
     var parsed = try cli.parse(a, args[1..]);
-    if (parsed.error_message) |message| return fail(err, message);
+    if (parsed.error_message) |message| return superviseFinalWrite(init.io, fail, .{ err, message });
     switch (parsed.action) {
         .help => {
             try out.writeAll(cli.help_text);
@@ -227,20 +285,13 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
     }
     const cfg = &parsed.config;
     if (init.environ_map.get("NICO_BASE_URL")) |url| cfg.base_url = std.mem.trimEnd(u8, url, "/");
-    if (try cli.validate(a, cfg)) |message| return fail(err, message);
-    var logfile: ?Io.File = null;
+    if (try cli.validate(a, cfg)) |message| return superviseFinalWrite(init.io, fail, .{ err, message });
+    const logfile = if (cfg.logfile.len > 0)
+        Io.Dir.cwd().createFile(init.io, cfg.logfile, .{ .truncate = false }) catch |e|
+            return superviseFinalWrite(init.io, fail, .{ err, try std.fmt.allocPrint(a, "open {s}: {s}", .{ cfg.logfile, @errorName(e) }) })
+    else
+        null;
     defer if (logfile) |file| file.close(init.io);
-    var log_buffer: [4096]u8 = undefined;
-    var file_writer: Io.File.Writer = undefined;
-    var log_writer = err;
-    if (cfg.logfile.len > 0) {
-        logfile = Io.Dir.cwd().createFile(init.io, cfg.logfile, .{ .truncate = false }) catch |e| return fail(err, try std.fmt.allocPrint(a, "open {s}: {s}", .{ cfg.logfile, @errorName(e) }));
-        file_writer = logfile.?.writer(init.io, &log_buffer);
-        // Query only the length: full Windows file metadata requires access
-        // that a write-only logfile handle intentionally does not request.
-        try file_writer.seekTo(try logfile.?.length(init.io));
-        log_writer = &file_writer.interface;
-    }
     var control = domain.Control.init(init.io, cfg);
     var client: HttpClient = .{ .allocator = init.gpa, .io = init.io };
     defer client.deinit();
@@ -255,11 +306,12 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
         .cfg = cfg,
         .out = out,
         .err = err,
-        .log_writer = log_writer,
+        .diagnostics = .{ .io = init.io, .err = err, .file = logfile, .buffer = .init(init.gpa) },
         .ctx = .{ .result_allocator = a, .temporary = init.gpa, .io = init.io, .cfg = cfg, .control = &control, .client = &client },
 
         .show_progress = !cfg.no_progress and (cfg.progress or try Io.File.stderr().isTty(init.io)),
     };
+    defer runner.diagnostics.buffer.deinit();
     runner.ctx.log_context = &runner;
     runner.ctx.log_fn = Runner.log;
     runner.ctx.trace_fn = Runner.trace;
@@ -271,25 +323,13 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
     const counts = runner.counts;
     var output_error = runner.output_error;
     if (!cfg.no_sort or cfg.json) {
-        var output: BufferedOutput = .{ .allocator = a, .io = init.io, .out = out, .cfg = cfg.*, .counts = counts, .invalid = runner.invalid.items, .results = results };
-        runner.output_count = output.write() catch |e| blk: {
+        var output: BufferedOutput = .{ .allocator = a, .out = out, .cfg = cfg.*, .counts = counts, .invalid = runner.invalid.items, .results = results };
+        runner.output_count = superviseFinalWrite(init.io, BufferedOutput.run, .{&output}) catch |e| blk: {
             output_error = e;
             break :blk 0;
         };
     }
-    try log_writer.print("{{\"level\":\"INFO\",\"msg\":\"video list\",\"count\":{d}}}\n", .{runner.output_count});
-    if (runner.show_progress) try err.writeByte('\n');
-    try err.print("summary inputs={d} valid={d} invalid={d} fetch_ok={d} fetch_err={d} output_count={d}\n", .{ counts.total, counts.valid, counts.invalid, runner.fetch_ok, runner.fetch_err, runner.output_count });
-    if (cfg.http_metrics) {
-        try log_writer.writeAll("{\"level\":\"INFO\",\"msg\":\"http_metrics\",\"http\":");
-        const snapshot = control.snapshot();
-        try std.json.Stringify.value(snapshot.jsonView(), .{ .emit_null_optional_fields = false }, log_writer);
-        try log_writer.writeAll("}\n");
-    }
-    try log_writer.flush();
-    if (output_error) |e| return fail(err, @errorName(e));
-    if (cli.exitMessage(cfg.*, counts.invalid, input_error, runner.first_error)) |message| return fail(err, message);
-    return 0;
+    return superviseFinalWrite(init.io, Runner.report, .{ &runner, input_error, output_error });
 }
 
 test "buffered output discards bytes after serialization and flush failures" {
@@ -308,7 +348,7 @@ test "buffered output discards bytes after serialization and flush failures" {
     for ([_]usize{ 5, 128 }) |size| {
         var storage: [128]u8 = undefined;
         var writer: FailedWriter = .{ .interface = .{ .buffer = storage[0..size], .vtable = &.{ .drain = FailedWriter.drain } } };
-        var output: BufferedOutput = .{ .allocator = std.testing.allocator, .io = std.testing.io, .out = &writer.interface, .cfg = .{ .no_sort = true }, .counts = .{}, .invalid = &.{}, .results = &results };
+        var output: BufferedOutput = .{ .allocator = std.testing.allocator, .out = &writer.interface, .cfg = .{ .no_sort = true }, .counts = .{}, .invalid = &.{}, .results = &results };
         try std.testing.expectError(error.WriteFailed, output.run());
         try std.testing.expectEqual(@as(usize, 0), writer.interface.end);
         try std.testing.expectEqual(@as(usize, 1), writer.calls);

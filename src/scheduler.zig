@@ -172,10 +172,13 @@ pub const Scheduler = struct {
     fn joinReady(self: *Scheduler, target: *Target, cancel_all: bool) void {
         for (target.jobs.items[target.next_commit..]) |job| {
             if (job.joined) continue;
-            const expired = job.deadline.cancelIfExpired(domain.now(self.ctx.io));
-            if (!cancel_all and !expired and !job.done.load(.acquire)) continue;
-            if (cancel_all) job.deadline.cancel();
-            const result = if (cancel_all or expired) job.future.?.cancel(self.ctx.io) else job.future.?.await(self.ctx.io);
+            // The earliest observed terminal page is an upper bound even
+            // while earlier page results are still pending.
+            const cancel_job = cancel_all or job.number > target.stop_before;
+            const expired = !cancel_job and job.deadline.cancelIfExpired(domain.now(self.ctx.io));
+            if (!cancel_job and !expired and !job.done.load(.acquire)) continue;
+            if (cancel_job) job.deadline.cancel();
+            const result = if (cancel_job or expired) job.future.?.cancel(self.ctx.io) else job.future.?.await(self.ctx.io);
             job.joined = true;
             target.running -= 1;
             if (result) |value| {
