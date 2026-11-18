@@ -79,7 +79,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         mode = server.mode
         try:
             if mode in ('redirect_close_delimited', 'redirect_truncated', 'redirect_stalled_body',
-                        'redirect_stalled_chunked', 'redirect_empty'):
+                        'redirect_stalled_chunked', 'redirect_stalled_close_delimited', 'redirect_empty'):
                 if n == 1:
                     headers = [(b'Location', b'/redirected')]
                     if mode == 'redirect_empty':
@@ -90,7 +90,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         return
                     if mode in ('redirect_truncated', 'redirect_stalled_body'):
                         headers.append((b'Content-Length', b'100'))
-                    if mode == 'redirect_stalled_body':
+                    if mode in ('redirect_stalled_body', 'redirect_stalled_close_delimited'):
                         self.stall(response(b'302 Found', headers, body=b'prefix'))
                         return
                     self.write(response(b'302 Found', headers, body=b'prefix'))
@@ -286,7 +286,8 @@ class HttpHeadTests(unittest.TestCase):
                 self.assertEqual(result['metrics']['retries'], 0, result)
 
     def test_redirect_follows_before_body_and_preserves_empty_keep_alive(self):
-        for mode in ('redirect_stalled_body', 'redirect_stalled_chunked', 'redirect_empty'):
+        for mode in ('redirect_stalled_body', 'redirect_stalled_chunked',
+                     'redirect_stalled_close_delimited', 'redirect_empty'):
             with self.subTest(mode=mode):
                 result = run(self.binary, mode)
                 self.assertEqual(result['exit'], 0, result)

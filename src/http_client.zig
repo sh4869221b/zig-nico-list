@@ -2188,7 +2188,6 @@ test "rejected response heads close without draining or pooling" {
         expected: anyerror,
         redirect_behavior: Request.RedirectBehavior = .init(1),
         redirect_buffer_len: usize = 256,
-        reads: usize = 1,
     };
     for ([_]Case{
         .{ .bytes = "HTTP/1.1 1:0 OK\r\n\r\n", .expected = error.HttpHeadersInvalid },
@@ -2201,8 +2200,6 @@ test "rejected response heads close without draining or pooling" {
         .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: ftp://localhost/\r\n\r\n", .expected = error.UnsupportedUriScheme },
         .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: /next\r\n\r\n", .expected = error.TooManyHttpRedirects, .redirect_behavior = .not_allowed },
         .{ .bytes = "HTTP/1.1 101 Switching Protocols\r\n\r\n", .expected = error.HttpProtocolSwitchUnsupported },
-        .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: /next\r\n\r\n", .expected = error.ReadFailed, .reads = 2 },
-        .{ .bytes = "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 1000\r\n\r\n", .expected = error.ReadFailed, .reads = 2 },
     }) |case| {
         var backend: HeadTestIo = .{ .remaining = case.bytes };
         var vtable = Io.failing.vtable.*;
@@ -2215,9 +2212,9 @@ test "rejected response heads close without draining or pooling" {
         var redirect_buffer: [256]u8 = undefined;
         try testing.expectError(case.expected, req.receiveHead(redirect_buffer[0..case.redirect_buffer_len]));
         try testing.expect(req.connection.?.closing);
-        try testing.expectEqual(case.reads, backend.reads);
+        try testing.expectEqual(@as(usize, 1), backend.reads);
         req.deinit();
-        try testing.expectEqual(case.reads, backend.reads);
+        try testing.expectEqual(@as(usize, 1), backend.reads);
         try testing.expectEqual(@as(usize, 1), backend.closes);
         try testing.expectEqual(@as(usize, 0), client.connection_pool.free_len);
     }
