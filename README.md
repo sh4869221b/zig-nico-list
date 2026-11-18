@@ -22,7 +22,7 @@ zig-nico-list --dedupe --stdin < targets.txt
 zig-nico-list --comment 10 --dateafter 20240101 --datebefore 20241231 --url https://www.nicovideo.jp/user/123
 ```
 
-Data goes to stdout. Progress, errors, logs, and the summary go to stderr, or logs to `--logfile` when requested. Concurrent invocations using the same logfile coordinate their JSONL appends. Dates are inclusive. IDs are numerically sorted unless `--no-sort` is set. Use `--help` for all options.
+Data goes to stdout. Progress, errors, logs, and the summary go to stderr, or logs to `--logfile` when requested. Concurrent invocations coordinate JSONL appends to the same regular file. Stream destinations such as a piped `/dev/stderr` receive records through streaming writes. Dates are inclusive. IDs are numerically sorted unless `--no-sort` is set. Use `--help` for all options.
 
 Concurrency controls are independent: `-T` limits active targets, `-P` limits pages per target, and `-H` caps active HTTP requests (`0` means unlimited). `-A` enables adaptive budgets for layers you have not explicitly fixed. Retry backoff, Retry-After, request pacing, cancellation, and natural empty/404 pagination termination are retained. Please respect niconico's rate limits.
 

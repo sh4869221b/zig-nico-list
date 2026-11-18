@@ -46,21 +46,53 @@ const Log = struct {
     io: Io,
     err: *Io.Writer,
     file: ?Io.File,
+    append: bool,
     buffer: Io.Writer.Allocating,
+    mutex: Io.Mutex = .init,
+
+    extern "kernel32" fn GetFileType(handle: std.os.windows.HANDLE) callconv(.winapi) u32;
+
+    fn isRegularFile(io: Io, file: Io.File) !bool {
+        if (builtin.os.tag == .windows) {
+            // FILE_TYPE_DISK also works with the write-only logfile handle.
+            return GetFileType(file.handle) == 1;
+        }
+        const stat = file.stat(io) catch |err| switch (err) {
+            error.Streaming => return false,
+            else => return err,
+        };
+        return stat.kind == .file;
+    }
 
     fn writeRecord(self: *Log, comptime encode: anytype, args: anytype) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.io.checkCancel();
         if (self.file) |file| {
             defer self.buffer.clearRetainingCapacity();
             try @call(.auto, encode, .{&self.buffer.writer} ++ args);
-            // Hold the file lock through the EOF lookup and any short writes.
-            try file.lock(self.io, .exclusive);
-            defer file.unlock(self.io);
-            try file.writePositionalAll(self.io, self.buffer.written(), try file.length(self.io));
+            if (self.append) {
+                // Hold the file lock through the EOF lookup and any short writes.
+                try file.lock(self.io, .exclusive);
+                defer file.unlock(self.io);
+                try file.writePositionalAll(self.io, self.buffer.written(), try file.length(self.io));
+            } else {
+                try file.writeStreamingAll(self.io, self.buffer.written());
+            }
         } else {
             errdefer self.err.end = 0;
             try @call(.auto, encode, .{self.err} ++ args);
             try self.err.flush();
         }
+    }
+
+    fn progress(self: *Log, completed: usize, total: usize) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.io.checkCancel();
+        errdefer self.err.end = 0;
+        try self.err.print("\r{d}/{d}", .{ completed, total });
+        try self.err.flush();
     }
 
     fn message(writer: *Io.Writer, level: []const u8, msg: []const u8, detail: []const u8) !void {
@@ -100,7 +132,8 @@ const Runner = struct {
     out: *Io.Writer,
     err: *Io.Writer,
     diagnostics: Log,
-    mutex: Io.Mutex = .init,
+    terminal_mutex: Io.Mutex = .init,
+    terminal_diagnostics: std.ArrayList(domain.TerminalDiagnostic) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .empty,
     completed: usize = 0,
     total: usize = 0,
@@ -118,14 +151,15 @@ const Runner = struct {
         const self: *Runner = @ptrCast(@alignCast(context));
         switch (value) {
             .input => |input| {
-                self.mutex.lockUncancelable(self.init.io);
-                defer self.mutex.unlock(self.init.io);
                 self.counts.total += 1;
                 self.total = self.counts.total;
                 if (cli.parseTarget(input) != null) self.counts.valid += 1 else {
                     self.counts.invalid += 1;
                     try self.invalid.append(self.ctx.result_allocator, input);
-                    try self.diagnostics.writeRecord(Log.message, .{ "WARN", "invalid input", input });
+                    if (!domain.canceled.load(.acquire))
+                        self.diagnostics.writeRecord(Log.message, .{ "WARN", "invalid input", input }) catch |err| {
+                            if (!domain.canceled.load(.acquire)) return err;
+                        };
                     self.completed += 1;
                     self.progress();
                 }
@@ -136,33 +170,49 @@ const Runner = struct {
 
     fn log(context: ?*anyopaque, level: []const u8, message: []const u8, detail: []const u8) void {
         const self: *Runner = @ptrCast(@alignCast(context.?));
-        self.mutex.lockUncancelable(self.init.io);
-        defer self.mutex.unlock(self.init.io);
         self.diagnostics.writeRecord(Log.message, .{ level, message, detail }) catch {};
     }
     fn trace(context: ?*anyopaque, value: domain.AttemptTrace) void {
         const self: *Runner = @ptrCast(@alignCast(context.?));
-        self.mutex.lockUncancelable(self.init.io);
-        defer self.mutex.unlock(self.init.io);
         self.diagnostics.writeRecord(Log.attempt, .{value}) catch {};
     }
-    fn progress(self: *Runner) void {
-        if (self.show_progress) {
-            self.err.print("\r{d}/{d}", .{ self.completed, self.total }) catch {};
-            self.err.flush() catch {};
+
+    fn queueTerminalDiagnostic(context: ?*anyopaque, diagnostic: domain.TerminalDiagnostic) void {
+        const self: *Runner = @ptrCast(@alignCast(context.?));
+        self.terminal_mutex.lockUncancelable(self.init.io);
+        defer self.terminal_mutex.unlock(self.init.io);
+        self.terminal_diagnostics.append(self.init.gpa, diagnostic) catch {};
+    }
+
+    fn writeTerminalDiagnostics(self: *Runner) !void {
+        self.terminal_mutex.lockUncancelable(self.init.io);
+        var diagnostics = self.terminal_diagnostics;
+        self.terminal_diagnostics = .empty;
+        self.terminal_mutex.unlock(self.init.io);
+        defer diagnostics.deinit(self.init.gpa);
+        for (diagnostics.items) |diagnostic| {
+            if (diagnostic.body_error) |name|
+                try self.diagnostics.writeRecord(Log.message, .{ "ERROR", "failed to read response body", name });
+            if (diagnostic.trace) |attempt| try self.diagnostics.writeRecord(Log.attempt, .{attempt});
         }
+    }
+
+    fn progress(self: *Runner) void {
+        if (self.show_progress and !domain.canceled.load(.acquire))
+            self.diagnostics.progress(self.completed, self.total) catch {};
     }
     fn complete(self: *Runner, result: *cli.TargetResult) !void {
         try self.results.append(self.ctx.result_allocator, result);
         if (self.cfg.no_sort and !self.cfg.json and result.error_message.len > 0)
             result.error_message = try self.ctx.result_allocator.dupe(u8, result.error_message);
-        self.mutex.lockUncancelable(self.init.io);
+        if (!domain.canceled.load(.acquire)) self.writeTerminalDiagnostics() catch {};
         if (result.error_message.len > 0) {
             self.fetch_err += 1;
             if (self.first_error == null) self.first_error = result.error_message;
-            self.diagnostics.writeRecord(Log.message, .{ "ERROR", "failed to get video list", result.error_message }) catch {};
+            if (!domain.canceled.load(.acquire))
+                self.diagnostics.writeRecord(Log.message, .{ "ERROR", "failed to get video list", result.error_message }) catch {};
         } else self.fetch_ok += 1;
-        self.mutex.unlock(self.init.io);
+        if (interrupted.load(.acquire)) return;
         // Only the sink task owns stdout, dedupe state and output counters.
         // Keep the diagnostic mutex free while stdout is backpressured so page
         // jobs can log and finish when the coordinator cancels/joins them.
@@ -196,8 +246,6 @@ const Runner = struct {
             if (write_failed) self.out.end = 0;
             if (self.output_error != null) domain.canceled.store(true, .release);
         }
-        self.mutex.lockUncancelable(self.init.io);
-        defer self.mutex.unlock(self.init.io);
         self.completed += 1;
         self.progress();
     }
@@ -205,6 +253,7 @@ const Runner = struct {
     fn report(self: *Runner, input_error: ?[]const u8, output_error: ?anyerror) !u8 {
         errdefer self.err.end = 0;
         const counts = self.counts;
+        try self.writeTerminalDiagnostics();
         try self.diagnostics.writeRecord(Log.videoList, .{self.output_count});
         if (self.show_progress) try self.err.writeByte('\n');
         try self.err.print("summary inputs={d} valid={d} invalid={d} fetch_ok={d} fetch_err={d} output_count={d}\n", .{ counts.total, counts.valid, counts.invalid, self.fetch_ok, self.fetch_err, self.output_count });
@@ -306,15 +355,23 @@ fn run(init: std.process.Init, out: *Io.Writer, err: *Io.Writer) !u8 {
         .cfg = cfg,
         .out = out,
         .err = err,
-        .diagnostics = .{ .io = init.io, .err = err, .file = logfile, .buffer = .init(init.gpa) },
+        .diagnostics = .{
+            .io = init.io,
+            .err = err,
+            .file = logfile,
+            .append = if (logfile) |file| try Log.isRegularFile(init.io, file) else false,
+            .buffer = .init(init.gpa),
+        },
         .ctx = .{ .result_allocator = a, .temporary = init.gpa, .io = init.io, .cfg = cfg, .control = &control, .client = &client },
 
         .show_progress = !cfg.no_progress and (cfg.progress or try Io.File.stderr().isTty(init.io)),
     };
     defer runner.diagnostics.buffer.deinit();
+    defer runner.terminal_diagnostics.deinit(init.gpa);
     runner.ctx.log_context = &runner;
     runner.ctx.log_fn = Runner.log;
     runner.ctx.trace_fn = Runner.trace;
+    runner.ctx.terminal_diagnostic_fn = Runner.queueTerminalDiagnostic;
     var engine = scheduler.Scheduler.init(init.gpa, runner.ctx, .{ .context = &runner, .emit = Runner.event });
     defer engine.deinit();
     const input_error = try engine.run(parsed.inputs);

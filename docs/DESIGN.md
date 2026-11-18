@@ -66,12 +66,13 @@ active deadline, with a 20 ms maximum signal-poll interval. Completion checks
 its own timestamp as well, so a short timeout cannot be missed between polls.
 
 The coordinator continues deadline and cancellation supervision while its one
-sink task emits an event, including when stdout is blocked. It does not admit
+sink task emits an event, including when stdout or stderr is blocked. It does not admit
 more input or launch more page work during emission. There is no output queue,
 and it joins the sink before releasing borrowed page memory or emitting another
-event. The sink releases the diagnostic mutex before writing stdout, so canceled
-HTTP jobs can log and finish independently. Caller cancellation also cancels a
-blocked sink; failed writes are not flushed again from a later cleanup path.
+event. Diagnostic mutex acquisition and writes can be canceled. The sink
+releases the diagnostic mutex before writing stdout, and caller cancellation
+releases a blocked sink before the coordinator joins other pages. Failed
+writes are not flushed again from a later cleanup path.
 After fetching finishes, sorted line output and JSON serialization plus their
 final flush run in an awaited output task. The final diagnostics and stream
 flushes use the same signal polling, so full stdout and stderr pipes remain
@@ -83,8 +84,13 @@ written before reporting that input error. SIGINT/SIGTERM can still interrupt
 the final write even after an input error has stopped fetching.
 
 Io.Future.cancel cancellation is consumed at the next cancellation point, and
-std.http may wrap it in ReadFailed. The owning Deadline therefore preserves the
-reason independently of the transport error. Client timeout stays Timeout for
+std.http or a diagnostic write may wrap the error. The owning Deadline
+preserves the reason independently of the returned error. Page jobs check
+the abort flag after diagnostics, during backoff and admission, and before
+starting and sending another request. Workers hand off timeout and cancellation
+diagnostics in memory so the coordinator can join them without waiting for
+the diagnostic writer.
+Client timeout stays Timeout for
 adaptive overload feedback and is propagated as a terminal page failure. It is
 not retried inside the canceled page future: the supervisor is joining that
 future and cannot supervise a new attempt there. A zero-byte response-head EOF on a reused socket can replay the GET once on a
@@ -151,7 +157,8 @@ original contract, not deleted features.
 
 Successful HTTP response bodies are buffered up to 8 MiB, inclusive, independent
 of Content-Length or framing. For gzip and deflate this limit applies to the
-decompressed body. The client verifies the compression footer and completes
+decompressed body. The client verifies mandatory compression header fields
+and the footer and completes
 HTTP framing before parsing JSON. Larger bodies fail with ResponseBodyTooLarge
 and earlier committed pages remain available through the partial-result contract.
 The client closes the rejected response immediately.

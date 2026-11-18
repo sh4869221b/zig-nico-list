@@ -133,10 +133,10 @@ pub const Scheduler = struct {
         try self.mutex.lock(self.ctx.io);
         defer self.mutex.unlock(self.ctx.io);
         while (self.pending_input != null) {
-            try domain.check(self.ctx.io);
+            try domain.check(self.ctx.io, null);
             try self.changed.wait(self.ctx.io, &self.mutex);
         }
-        try domain.check(self.ctx.io);
+        try domain.check(self.ctx.io, null);
         self.pending_input = value;
         self.pending_announced = false;
         self.epoch +%= 1;
@@ -144,7 +144,7 @@ pub const Scheduler = struct {
         // Acknowledge consumption before scanning another line, just like a
         // bounded input channel. EOF/read errors cannot overtake this input.
         while (self.pending_input != null) {
-            try domain.check(self.ctx.io);
+            try domain.check(self.ctx.io, null);
             try self.changed.wait(self.ctx.io, &self.mutex);
         }
     }
@@ -243,15 +243,16 @@ pub const Scheduler = struct {
             self.mutex.lockUncancelable(self.ctx.io);
             const epoch = self.epoch;
             self.mutex.unlock(self.ctx.io);
-            const cancel_all = domain.canceled.load(.acquire);
-            for (self.targets.items) |target| {
-                if (!target.finished) self.joinReady(target, cancel_all);
-            }
-            if (cancel_all) {
+            if (domain.canceled.load(.acquire)) {
                 self.input_future.?.cancel(self.ctx.io);
-                // A stalled stdout write must also respond to SIGINT. The sink
-                // owns the writer until this joins and handles write failures.
-                return future.cancel(self.ctx.io);
+                // Release the sink's writers before joining any other pages.
+                // A page can be waiting for the sink's diagnostic mutex.
+                return future.cancel(self.ctx.io) catch |err| {
+                    if (err != error.Canceled) return err;
+                };
+            }
+            for (self.targets.items) |target| {
+                if (!target.finished) self.joinReady(target, false);
             }
             self.waitForChange(epoch);
         }

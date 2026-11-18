@@ -104,6 +104,23 @@ def command(server, *args, process_timeout=15, **kwargs):
                           env=env, capture_output=True, text=True, timeout=process_timeout, **kwargs)
 
 
+@contextlib.contextmanager
+def full_pipe():
+    read_end, write_end = os.pipe()
+    try:
+        os.set_blocking(write_end, False)
+        try:
+            while True:
+                os.write(write_end, b'x' * 512)
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_end, True)
+        yield write_end
+    finally:
+        os.close(write_end)
+        os.close(read_end)
+
+
 class CliIntegration(unittest.TestCase):
     def check_ok(self, result, expected):
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -429,11 +446,40 @@ class CliIntegration(unittest.TestCase):
                     self.assertIn(f'Error: {error}\n', result.stderr)
                 self.assertEqual(server.requests, [1])
 
+    def test_compression_requires_valid_member_headers(self):
+        payload = body(('sm1',))
+        gzip_wire = gzip.compress(payload)
+        gzip_reserved = gzip_wire[:3] + bytes([gzip_wire[3] | 0x20]) + gzip_wire[4:]
+        empty_member = gzip.compress(b'')
+        empty_reserved = empty_member[:3] + bytes([empty_member[3] | 0x20]) + empty_member[4:]
+        zlib_wire = zlib.compress(payload)
+        bad_fcheck = zlib_wire[:1] + bytes([zlib_wire[1] ^ 1]) + zlib_wire[2:]
+        # Set FDICT and recalculate FCHECK without adding a dictionary ID.
+        # A decoder that ignores FLG will accept the following DEFLATE stream.
+        cmf = zlib_wire[0]
+        flg = 0x20
+        flg += (-(cmf * 256 + flg)) % 31
+        no_dictionary = bytes([cmf, flg]) + zlib_wire[2:]
+        for label, encoding, compressed in (
+                ('gzip reserved bit', 'gzip', gzip_reserved),
+                ('second gzip member reserved bit', 'gzip', gzip_wire + empty_reserved),
+                ('zlib FCHECK', 'deflate', bad_fcheck),
+                ('zlib FDICT', 'deflate', no_dictionary)):
+            with self.subTest(case=label), fixture(
+                    lambda *_: (200, compressed, {'Content-Encoding': encoding}, False)) as server:
+                result = command(server, '-P2', '--http-metrics', USER)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('Error: InvalidCompressedResponseBody\n', result.stderr)
+                self.assertEqual(server.requests, [1])
+
     def test_invalid_retry_after_uses_normal_backoff(self):
-        future_date = email.utils.format_datetime(
-            datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=4),
-            usegmt=True)
-        for value in ('0_2', future_date.replace('GMT', 'PST')):
+        for case in ('underscore', 'timezone', 'weekday'):
+            future_date = email.utils.format_datetime(
+                datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=4), usegmt=True)
+            wrong_weekday = 'Tue' if future_date.startswith('Mon') else 'Mon'
+            value = {'underscore': '0_2', 'timezone': future_date.replace('GMT', 'PST'),
+                     'weekday': wrong_weekday + future_date[3:]}[case]
             def reply(page, attempt, path):
                 return ((429, b'', {'Retry-After': value}, False) if attempt == 1
                         else (200, body(('sm1',)), {}, False))
@@ -652,6 +698,15 @@ class CliIntegration(unittest.TestCase):
             self.assertTrue(appended.startswith(first))
             self.assertGreater(len(appended), len(first))
 
+    @unittest.skipUnless(Path('/dev/stderr').exists(), 'requires /dev/stderr')
+    def test_logfile_can_stream_to_stderr_pipe(self):
+        with fixture() as server:
+            result = command(server, '-P2', '--logfile', '/dev/stderr', '--http-metrics', USER)
+            self.check_ok(result, 'sm2\nsm10\n')
+        records = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+        self.assertEqual([record['msg'] for record in records],
+                         ['http_attempt', 'video list', 'http_metrics'])
+
     def test_concurrent_logfile_writers_append_complete_records(self):
         both_open = threading.Event()
 
@@ -734,34 +789,102 @@ class CliIntegration(unittest.TestCase):
                 rows = [json.loads(line) for line in path.read_text().splitlines()]
                 self.assertTrue(any(row.get('attempt', {}).get('status') == 429 for row in rows))
 
+    @unittest.skipUnless(os.name == 'posix', 'requires a separate process file lock')
+    def test_terminal_empty_page_cancels_later_retry_when_log_is_locked(self):
+        import fcntl
+        third_requested = threading.Event()
+        finish_second = threading.Event()
+
+        def reply(page, attempt, path):
+            if page == 1:
+                return 200, body(('sm1',), total=300), {}, False
+            if page == 2:
+                finish_second.wait(5)
+                return 200, body((), total=300), {}, False
+            if third_requested.is_set():
+                return 404, b'', {}, False
+            third_requested.set()
+            return 429, b'', {'Retry-After': '2'}, False
+
+        with tempfile.TemporaryDirectory() as tmp, fixture(reply) as server:
+            path = Path(tmp) / 'locked.jsonl'
+            env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+            with path.open('wb') as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                with subprocess.Popen(
+                        [BINARY, '--no-progress', '-P3', '-H3', '--retries', '2', '--timeout', '5s',
+                         '--logfile', str(path), '--json', USER],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+                    try:
+                        self.assertTrue(third_requested.wait(3))
+                        # Give the 429 worker time to reach the blocked diagnostic append.
+                        time.sleep(.2)
+                        self.assertEqual(path.stat().st_size, 0)
+                        finish_second.set()
+                        # Stdout can finish while the final report still waits for the lock.
+                        ready_before_unlock = bool(select.select([proc.stdout], [], [], 1)[0])
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
+                        stdout, stderr = proc.communicate(timeout=5)
+                        self.assertEqual(proc.returncode, 0, stderr)
+                        self.assertEqual(json.loads(stdout)['items'], ['sm1'])
+                        self.assertCountEqual(server.requests, [1, 2, 3])
+                        self.assertTrue(ready_before_unlock, 'output waited on the discarded page')
+                    finally:
+                        finish_second.set()
+                        if proc.poll() is None:
+                            proc.kill()
+
     @unittest.skipUnless(os.name == 'posix', 'POSIX graceful SIGTERM test')
-    def test_sigterm_cancels_final_flush_of_full_stderr(self):
-        for logfile in (False, True):
-            with self.subTest(logfile=logfile), fixture() as server, tempfile.TemporaryDirectory() as tmp:
-                read_end, write_end = os.pipe()
-                try:
-                    os.set_blocking(write_end, False)
-                    with self.assertRaises(BlockingIOError):
-                        while True:
-                            os.write(write_end, b'x' * 512)
-                    os.set_blocking(write_end, True)
+    def test_sigterm_cancels_inflight_diagnostics_with_full_stderr(self):
+        for mode in ('body', '429 metrics', '429 metrics and body deadline'):
+            with self.subTest(mode=mode):
+                def reply(page, attempt, path):
+                    if mode == '429 metrics' or '/users/2/' in path:
+                        return 429, b'', {'Retry-After': '20'}, False
+                    return 200, body(), {}, True
+
+                with fixture(reply) as server, full_pipe() as stderr:
+                    mixed = mode == '429 metrics and body deadline'
                     env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
-                    args = ['--logfile', str(Path(tmp) / 'run.jsonl')] if logfile else []
-                    with subprocess.Popen([BINARY, '--no-progress', '-P2', *args, USER],
-                                          env=env, stdout=subprocess.PIPE, stderr=write_end) as proc:
+                    args = [BINARY, '--no-progress', '--http-metrics',
+                            '--timeout', '300ms' if mixed else '5s', USER]
+                    if mixed:
+                        args.append('https://www.nicovideo.jp/user/2')
+                    with subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=stderr) as proc:
                         try:
-                            self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
-                            with self.assertRaises(subprocess.TimeoutExpired):
-                                proc.wait(timeout=.1)
+                            self.assertTrue(server.headers_sent.wait(3))
+                            if mixed:
+                                until = time.monotonic() + 3
+                                while len(server.requests) < 2 and time.monotonic() < until:
+                                    time.sleep(.01)
+                                self.assertEqual(len(server.requests), 2)
+                            time.sleep(.5 if mixed else .15)
+                            self.assertIsNone(proc.poll())
                             proc.send_signal(signal.SIGTERM)
                             self.assertEqual(proc.wait(timeout=3), 1)
-                            self.assertEqual(proc.stdout.read(), b'sm2\nsm10\n')
+                            self.assertEqual(len(server.requests), 2 if mixed else 1)
                         finally:
                             if proc.poll() is None:
                                 proc.kill()
-                finally:
-                    os.close(write_end)
-                    os.close(read_end)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX graceful SIGTERM test')
+    def test_sigterm_cancels_final_flush_of_full_stderr(self):
+        for logfile in (False, True):
+            with self.subTest(logfile=logfile), fixture() as server, tempfile.TemporaryDirectory() as tmp, full_pipe() as stderr:
+                env = dict(os.environ, NICO_BASE_URL=f'http://127.0.0.1:{server.server_port}/v3')
+                args = ['--logfile', str(Path(tmp) / 'run.jsonl')] if logfile else []
+                with subprocess.Popen([BINARY, '--no-progress', '-P2', *args, USER],
+                                      env=env, stdout=subprocess.PIPE, stderr=stderr) as proc:
+                    try:
+                        self.assertTrue(select.select([proc.stdout], [], [], 3)[0])
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            proc.wait(timeout=.1)
+                        proc.send_signal(signal.SIGTERM)
+                        self.assertEqual(proc.wait(timeout=3), 1)
+                        self.assertEqual(proc.stdout.read(), b'sm2\nsm10\n')
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
 
     def test_scheduler_terminal_and_deadline_regressions(self):
         for mode in ('earlier_empty', 'earlier_404', 'earlier_error', 'short_deadline',

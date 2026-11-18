@@ -82,6 +82,8 @@ attempt numbers, and an invocation-local unique `request_id` (dispatch order).
   `timeouts`, `cancellations`, and `body_errors` distinguish failure causes.
   `body_bytes` counts complete bodies retained for JSON parsing, after
   decompression when applicable.
+  Timeout and cancellation diagnostics can be emitted by the output task
+  after another attempt's diagnostics. Use `request_id` to correlate them.
 - `service_ns` and all phase timings sum concurrent attempt durations, so they
   can exceed wall time. Semaphore/rate/backoff remain separate aggregate fields;
   `backoff_wait_ns` is scheduled retry delay, not measured sleep or shared cooldown.
