@@ -869,8 +869,26 @@ class CliIntegration(unittest.TestCase):
             self.assertIn(b'IsDir', stderr_path.read_bytes())
             self.assertEqual(server.requests, [])
 
+    @unittest.skipUnless(os.name == 'posix', 'requires POSIX path limits and symlinks')
+    def test_unresolvable_logfile_path_errors_reach_regular_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = root / 'loop'
+            loop.symlink_to(loop.name)
+            oversized = root / ('x' * (os.pathconf(root, 'PC_NAME_MAX') + 1))
+            for log, error_name in ((oversized, 'NameTooLong'), (loop, 'SymLinkLoop')):
+                with self.subTest(error_name=error_name):
+                    stderr_path = root / 'stderr.txt'
+                    with stderr_path.open('wb') as stderr:
+                        result = subprocess.run([BINARY, '--no-progress', '--logfile', str(log), '--stdin'],
+                                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                stderr=stderr, timeout=3)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, b'')
+                    self.assertIn(f'open {log}: {error_name}\n'.encode(), stderr_path.read_bytes())
+
     @unittest.skipUnless(os.name == 'posix' and os.geteuid() != 0, 'requires non-root POSIX permissions')
-    def test_logfile_access_denied_reports_only_to_separate_regular_stderr(self):
+    def test_logfile_access_denied_reports_to_a_pipe_and_preserves_regular_stderr(self):
         with tempfile.TemporaryDirectory() as tmp, fixture() as server:
             log = Path(tmp) / 'read-only.jsonl'
             stderr_path = Path(tmp) / 'stderr.txt'
@@ -883,11 +901,15 @@ class CliIntegration(unittest.TestCase):
                 with stderr_path.open('wb') as separate_stderr:
                     separate = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=separate_stderr, timeout=3)
                 shared = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=shared_stderr, timeout=3)
+                piped = subprocess.run(args, env=env, capture_output=True, timeout=3)
             self.assertEqual(separate.returncode, 1)
             self.assertEqual(shared.returncode, 1)
+            self.assertEqual(piped.returncode, 1)
             self.assertEqual(separate.stdout, b'')
             self.assertEqual(shared.stdout, b'')
-            self.assertIn(b'AccessDenied', stderr_path.read_bytes())
+            self.assertEqual(piped.stdout, b'')
+            self.assertIn(b'AccessDenied', piped.stderr)
+            self.assertEqual(stderr_path.read_bytes(), b'')
             self.assertEqual(log.read_bytes(), original)
             self.assertEqual(server.requests, [])
 

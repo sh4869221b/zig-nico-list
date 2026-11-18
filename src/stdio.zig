@@ -91,19 +91,11 @@ const Identity = struct {
     }
 };
 
-fn failedTargetIsDistinct(io: Io, dir: Io.Dir, path: []const u8, stderr: Io.File, err: Io.File.OpenError) bool {
+fn canReportPathError(path: []const u8, err: Io.File.OpenError) bool {
+    // With no handle, a later lookup could identify a replacement file.
+    // Only report errors that rule out a regular target on their own.
     return switch (err) {
-        error.IsDir => true,
-        error.FileNotFound, error.NotDir => descriptorPath(path) == null,
-        error.AccessDenied => blk: {
-            // A failed open supplies no handle. Metadata may still identify
-            // the path without requiring permission to read or write it.
-            const target = dir.statFile(io, path, .{}) catch break :blk false;
-            const inherited = stderr.stat(io) catch break :blk false;
-            // Different inode numbers prove a difference without the volume.
-            break :blk target.kind != inherited.kind or
-                (target.inode != 0 and inherited.inode != 0 and target.inode != inherited.inode);
-        },
+        error.BadPathName, error.FileNotFound, error.IsDir, error.NameTooLong, error.NotDir, error.SymLinkLoop => descriptorPath(path) == null,
         else => false,
     };
 }
@@ -112,7 +104,7 @@ pub fn openLog(io: Io, path: []const u8, stderr: Io.File, can_report_on_stderr: 
     const dir = Io.Dir.cwd();
     const stderr_is_stream = can_report_on_stderr.*;
     const opened = dir.createFile(io, path, .{ .truncate = false }) catch |err| {
-        can_report_on_stderr.* = stderr_is_stream or failedTargetIsDistinct(io, dir, path, stderr, err);
+        can_report_on_stderr.* = stderr_is_stream or canReportPathError(path, err);
         return err;
     };
     errdefer opened.close(io);
@@ -134,7 +126,7 @@ pub fn openLog(io: Io, path: []const u8, stderr: Io.File, can_report_on_stderr: 
         path;
     const file = dir.openFile(io, reopen_path, .{ .mode = .read_write }) catch |err| {
         can_report_on_stderr.* = stderr_is_stream or
-            (first_is_distinct and failedTargetIsDistinct(io, dir, reopen_path, stderr, err));
+            (first_is_distinct and canReportPathError(path, err));
         return err;
     };
     errdefer file.close(io);
@@ -320,15 +312,26 @@ test "logfile replacement is compared with inherited stderr before reporting" {
         io: Io,
         dir: Io.Dir,
         replacement: []const u8,
+        deny: enum { neither, first_open, reopen } = .neither,
+        path_lookups: usize = 0,
 
         fn create(context: ?*anyopaque, _: Io.Dir, path: []const u8, options: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
             const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.deny == .first_open) return error.AccessDenied;
             return self.dir.createFile(self.io, path, options);
         }
 
         fn open(context: ?*anyopaque, _: Io.Dir, _: []const u8, options: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
             const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.deny == .reopen) return error.AccessDenied;
             return self.dir.openFile(self.io, self.replacement, options);
+        }
+
+        fn statPath(context: ?*anyopaque, _: Io.Dir, _: []const u8, options: Io.Dir.StatFileOptions) Io.Dir.StatFileError!Io.File.Stat {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.path_lookups += 1;
+            // The path is replaced with a distinct file after the denied open.
+            return self.dir.statFile(self.io, self.replacement, options);
         }
 
         fn stat(context: ?*anyopaque, file: Io.File) Io.File.StatError!Io.File.Stat {
@@ -351,6 +354,7 @@ test "logfile replacement is compared with inherited stderr before reporting" {
     var vtable = Io.failing.vtable.*;
     vtable.dirCreateFile = Backend.create;
     vtable.dirOpenFile = Backend.open;
+    vtable.dirStatFile = Backend.statPath;
     vtable.fileStat = Backend.stat;
     vtable.fileClose = Backend.close;
     const replaced_io: Io = .{ .userdata = &backend, .vtable = &vtable };
@@ -368,6 +372,15 @@ test "logfile replacement is compared with inherited stderr before reporting" {
         try std.testing.expectError(error.LogFileChanged, openLog(replaced_io, "original.log", stderr_file, &can_report));
         try std.testing.expect(!can_report);
     }
+
+    backend.replacement = "other.log";
+    for ([_]@FieldType(Backend, "deny"){ .first_open, .reopen }) |stage| {
+        backend.deny = stage;
+        can_report = false;
+        try std.testing.expectError(error.AccessDenied, openLog(replaced_io, "original.log", stderr_file, &can_report));
+        try std.testing.expect(!can_report);
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.path_lookups);
 }
 
 test "one shared output batch keeps its lock across short writes and ID terminators" {

@@ -114,9 +114,11 @@ tail while holding the lock. If a failed rollback or interrupted writer leaves
 an unterminated tail, the next append fails and preserves the bytes. Shared
 file progress updates end with a newline so they are complete records too.
 Logfile setup compares both the write-only handle and the read/write handle
-with inherited stderr. When an open fails, file metadata can still establish
-that the destination differs from stderr. If stderr may share the file, a
-setup failure exits with status 1 without writing to the inherited offset.
+with inherited stderr. After a failed open, the path can already point to a
+replacement file. Diagnostics to regular stderr rely on the opened handles
+and path errors that rule out a regular target, such as `NameTooLong` and
+`SymLinkLoop`. An ambiguous access failure exits with status 1 and leaves
+regular stderr untouched. Stream stderr still receives the diagnostic.
 Startup checks the tail before reading inputs when the lock is available.
 When another writer holds the lock, a cancellable task checks the tail once
 it acquires the lock, independently of HTTP metrics and writes. The
